@@ -41,7 +41,7 @@ loaded_lora_url = None
 
 
 def load_model():
-    """Load Flux Dev pipeline once."""
+    """Load Flux Dev pipeline once. Tries network volume first, then HF Hub."""
     global pipe
     if pipe is not None:
         return
@@ -49,14 +49,26 @@ def load_model():
     print("[TGND] Loading Flux Dev pipeline...")
     t0 = time.time()
 
-    model_id = "black-forest-labs/FLUX.1-dev"
+    # Try network volume first (fast, no download)
+    volume_path = "/runpod-volume/flux-dev"
+    if os.path.exists(volume_path):
+        print(f"[TGND] Loading from network volume: {volume_path}")
+        model_source = volume_path
+    else:
+        # Fallback to HuggingFace Hub (requires HF_TOKEN env var)
+        hf_token = os.environ.get("HF_TOKEN", "")
+        if hf_token:
+            from huggingface_hub import login
+            login(token=hf_token)
+        model_source = "black-forest-labs/FLUX.1-dev"
+        print(f"[TGND] Downloading from HuggingFace Hub...")
+
     pipe = FluxPipeline.from_pretrained(
-        model_id,
+        model_source,
         torch_dtype=torch.bfloat16,
     )
-    pipe.to("cuda")
 
-    # Enable memory optimizations
+    # Enable memory optimizations for GPU
     pipe.enable_model_cpu_offload()
 
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s")

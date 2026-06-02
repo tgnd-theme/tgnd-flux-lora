@@ -15,15 +15,9 @@ RUN pip install --no-cache-dir \
     requests==2.32.3 \
     Pillow==11.0.0
 
-# Pre-download Flux Dev model weights during build (cached in image)
-# This avoids slow cold starts
-RUN python3 -c "\
-from diffusers import FluxPipeline; \
-import torch; \
-print('Downloading Flux Dev...'); \
-pipe = FluxPipeline.from_pretrained('black-forest-labs/FLUX.1-dev', torch_dtype=torch.bfloat16); \
-print('Model cached successfully'); \
-del pipe"
+# Model weights are loaded at runtime from either:
+# 1. RunPod Network Volume (/runpod-volume/flux-dev/)
+# 2. HuggingFace Hub (fallback, requires HF_TOKEN env var)
 
 # Copy handler
 COPY handler.py /app/handler.py

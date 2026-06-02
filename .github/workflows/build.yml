@@ -39,5 +39,3 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-        env:
-          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
