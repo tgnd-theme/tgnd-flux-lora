@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir \
     protobuf==5.28.3 \
     huggingface_hub==0.26.2 \
     requests==2.32.3 \
-    Pillow==11.0.0
+    Pillow==11.0.0 \
+    peft==0.13.2
 
 # Model weights are loaded at runtime from either:
 # 1. RunPod Network Volume (/runpod-volume/flux-dev/)
