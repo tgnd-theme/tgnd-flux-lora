@@ -1,18 +1,22 @@
 """
-RunPod Serverless Handler — Flux Dev + LoRA inference.
+RunPod Serverless Handler — Flux Dev + Multi-LoRA inference.
 
 No safety checker. No NSFW filter. Full control.
 
 Input:
 {
     "prompt": "...",
-    "lora_url": "https://...safetensors",   # optional, cached after first load
-    "lora_scale": 1.0,                       # optional, default 1.0
+    "loras": [                                  # optional, list of LoRAs
+        {"url": "https://...safetensors", "scale": 1.0},
+        {"url": "https://...safetensors", "scale": 0.8}
+    ],
+    "lora_url": "https://...safetensors",       # legacy single LoRA support
+    "lora_scale": 1.0,
     "width": 768,
     "height": 1024,
-    "guidance_scale": 1.5,
+    "guidance_scale": 2.5,
     "num_inference_steps": 28,
-    "seed": 42                               # optional, random if omitted
+    "seed": 42                                  # optional, random if omitted
 }
 
 Output:
@@ -26,18 +30,17 @@ Output:
 import os
 import io
 import base64
+import hashlib
 import random
 import time
 import runpod
 import torch
 from diffusers import FluxPipeline
-from safetensors.torch import load_file
-from huggingface_hub import hf_hub_download
 import requests
 
 # ─── Globals (loaded once on cold start) ───
 pipe = None
-loaded_lora_url = None
+loaded_lora_key = None
 
 
 def load_model():
@@ -49,63 +52,92 @@ def load_model():
     print("[TGND] Loading Flux Dev pipeline...")
     t0 = time.time()
 
-    # Try network volume first (fast, no download)
     volume_path = "/runpod-volume/flux-dev"
     if os.path.exists(volume_path):
         print(f"[TGND] Loading from network volume: {volume_path}")
         model_source = volume_path
     else:
-        # Fallback to HuggingFace Hub (requires HF_TOKEN env var)
         hf_token = os.environ.get("HF_TOKEN", "")
         if hf_token:
             from huggingface_hub import login
             login(token=hf_token)
         model_source = "black-forest-labs/FLUX.1-dev"
-        print(f"[TGND] Downloading from HuggingFace Hub...")
+        print("[TGND] Downloading from HuggingFace Hub...")
 
     pipe = FluxPipeline.from_pretrained(
         model_source,
         torch_dtype=torch.bfloat16,
     )
-
-    # Enable memory optimizations for GPU
     pipe.enable_model_cpu_offload()
 
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s")
 
 
-def load_lora(lora_url, lora_scale=1.0):
-    """Load LoRA weights from URL, cached between requests."""
-    global loaded_lora_url
+def download_lora(url):
+    """Download LoRA file, using cache if available."""
+    url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
+    cache_path = f"/tmp/lora_{url_hash}.safetensors"
 
-    if not lora_url:
-        return
+    if os.path.exists(cache_path):
+        print(f"[TGND] LoRA cached: {cache_path}")
+        return cache_path
 
-    if loaded_lora_url == lora_url:
-        print(f"[TGND] LoRA already loaded: {lora_url[:60]}...")
-        return
-
-    print(f"[TGND] Loading LoRA from: {lora_url[:80]}...")
-    t0 = time.time()
-
-    # Download to temp file
-    lora_path = "/tmp/current_lora.safetensors"
-    resp = requests.get(lora_url, timeout=120)
+    print(f"[TGND] Downloading LoRA: {url[:80]}...")
+    resp = requests.get(url, timeout=120)
     resp.raise_for_status()
-    with open(lora_path, "wb") as f:
+    with open(cache_path, "wb") as f:
         f.write(resp.content)
+    print(f"[TGND] Downloaded {len(resp.content) / 1024 / 1024:.1f}MB")
+    return cache_path
 
-    # Unload any previous LoRA
+
+def load_loras(lora_configs):
+    """Load one or more LoRAs. Caches the combination."""
+    global loaded_lora_key
+
+    if not lora_configs:
+        # No LoRAs requested — unload if any loaded
+        if loaded_lora_key:
+            try:
+                pipe.unload_lora_weights()
+            except Exception:
+                pass
+            loaded_lora_key = None
+        return None
+
+    # Create a cache key from URLs
+    cache_key = "|".join(sorted(c["url"] for c in lora_configs))
+    if loaded_lora_key == cache_key:
+        print(f"[TGND] LoRAs already loaded ({len(lora_configs)} adapters)")
+        return {f"lora_{i}": c["scale"] for i, c in enumerate(lora_configs)}
+
+    # Unload previous
     try:
         pipe.unload_lora_weights()
     except Exception:
         pass
 
-    # Load new LoRA
-    pipe.load_lora_weights(lora_path)
+    t0 = time.time()
+    adapter_names = []
+    adapter_weights = []
 
-    loaded_lora_url = lora_url
-    print(f"[TGND] LoRA loaded in {time.time() - t0:.1f}s ({len(resp.content) / 1024 / 1024:.1f}MB)")
+    for i, cfg in enumerate(lora_configs):
+        name = f"lora_{i}"
+        path = download_lora(cfg["url"])
+        pipe.load_lora_weights(path, adapter_name=name)
+        adapter_names.append(name)
+        adapter_weights.append(cfg["scale"])
+        print(f"[TGND] Loaded adapter '{name}' (scale={cfg['scale']})")
+
+    # Set active adapters with weights
+    if len(adapter_names) > 1:
+        pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+
+    loaded_lora_key = cache_key
+    print(f"[TGND] {len(lora_configs)} LoRAs loaded in {time.time() - t0:.1f}s")
+
+    # Return scale for joint_attention_kwargs (use max scale)
+    return {name: weight for name, weight in zip(adapter_names, adapter_weights)}
 
 
 def handler(job):
@@ -119,16 +151,20 @@ def handler(job):
     # Load model on first request
     load_model()
 
-    # Load LoRA if specified
-    lora_url = inp.get("lora_url", "")
-    lora_scale = float(inp.get("lora_scale", 1.0))
-    if lora_url:
-        load_lora(lora_url, lora_scale)
+    # Build LoRA config list
+    lora_configs = inp.get("loras", [])
+    if not lora_configs:
+        # Legacy single LoRA support
+        lora_url = inp.get("lora_url", "")
+        if lora_url:
+            lora_configs = [{"url": lora_url, "scale": float(inp.get("lora_scale", 1.0))}]
+
+    adapters = load_loras(lora_configs)
 
     # Generation params
     width = int(inp.get("width", 768))
     height = int(inp.get("height", 1024))
-    guidance_scale = float(inp.get("guidance_scale", 1.5))
+    guidance_scale = float(inp.get("guidance_scale", 2.5))
     num_steps = int(inp.get("num_inference_steps", 28))
     seed = int(inp.get("seed", random.randint(1, 2147483647)))
 
@@ -137,6 +173,9 @@ def handler(job):
 
     generator = torch.Generator("cuda").manual_seed(seed)
 
+    # Use scale from first adapter if single LoRA
+    lora_scale = lora_configs[0]["scale"] if len(lora_configs) == 1 else 1.0
+
     result = pipe(
         prompt=prompt,
         width=width,
@@ -144,7 +183,7 @@ def handler(job):
         guidance_scale=guidance_scale,
         num_inference_steps=num_steps,
         generator=generator,
-        joint_attention_kwargs={"scale": lora_scale} if lora_url else None,
+        joint_attention_kwargs={"scale": lora_scale} if lora_configs else None,
     )
 
     image = result.images[0]
