@@ -44,7 +44,8 @@ loaded_lora_key = None
 
 
 def load_model():
-    """Load Flux Dev pipeline once. Tries network volume first, then HF Hub."""
+    """Load Flux Dev pipeline once. Tries network volume first, then HF Hub.
+    If loaded from HF and a network volume is mounted, saves to volume for next time."""
     global pipe
     if pipe is not None:
         return
@@ -53,7 +54,10 @@ def load_model():
     t0 = time.time()
 
     volume_path = "/runpod-volume/flux-dev"
-    if os.path.exists(volume_path):
+    volume_mounted = os.path.exists("/runpod-volume")
+    saved_to_volume = False
+
+    if os.path.exists(volume_path) and os.listdir(volume_path):
         print(f"[TGND] Loading from network volume: {volume_path}")
         model_source = volume_path
     else:
@@ -63,6 +67,7 @@ def load_model():
             login(token=hf_token)
         model_source = "black-forest-labs/FLUX.1-dev"
         print("[TGND] Downloading from HuggingFace Hub...")
+        saved_to_volume = volume_mounted  # will save after loading
 
     pipe = FluxPipeline.from_pretrained(
         model_source,
@@ -70,25 +75,52 @@ def load_model():
     )
     pipe.enable_model_cpu_offload()
 
+    # Cache to network volume for faster future cold starts
+    if saved_to_volume:
+        try:
+            print(f"[TGND] Saving model to network volume: {volume_path}")
+            os.makedirs(volume_path, exist_ok=True)
+            pipe.save_pretrained(volume_path)
+            print(f"[TGND] Model saved to volume!")
+        except Exception as e:
+            print(f"[TGND] Could not save to volume: {e}")
+
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s")
 
 
 def download_lora(url):
-    """Download LoRA file, using cache if available."""
+    """Download LoRA file, using network volume or /tmp cache."""
     url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
-    cache_path = f"/tmp/lora_{url_hash}.safetensors"
 
-    if os.path.exists(cache_path):
-        print(f"[TGND] LoRA cached: {cache_path}")
-        return cache_path
+    # Check network volume cache first (persists across cold starts)
+    volume_cache = f"/runpod-volume/loras/lora_{url_hash}.safetensors"
+    if os.path.exists(volume_cache):
+        print(f"[TGND] LoRA from volume: {volume_cache}")
+        return volume_cache
+
+    # Check /tmp cache (persists within same worker)
+    tmp_cache = f"/tmp/lora_{url_hash}.safetensors"
+    if os.path.exists(tmp_cache):
+        print(f"[TGND] LoRA from tmp: {tmp_cache}")
+        return tmp_cache
 
     print(f"[TGND] Downloading LoRA: {url[:80]}...")
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
-    with open(cache_path, "wb") as f:
-        f.write(resp.content)
-    print(f"[TGND] Downloaded {len(resp.content) / 1024 / 1024:.1f}MB")
-    return cache_path
+    data = resp.content
+    print(f"[TGND] Downloaded {len(data) / 1024 / 1024:.1f}MB")
+
+    # Save to network volume if available, otherwise /tmp
+    if os.path.exists("/runpod-volume"):
+        os.makedirs("/runpod-volume/loras", exist_ok=True)
+        with open(volume_cache, "wb") as f:
+            f.write(data)
+        print(f"[TGND] LoRA saved to volume: {volume_cache}")
+        return volume_cache
+    else:
+        with open(tmp_cache, "wb") as f:
+            f.write(data)
+        return tmp_cache
 
 
 def load_loras(lora_configs):
