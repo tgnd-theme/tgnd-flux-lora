@@ -1,5 +1,5 @@
 """
-RunPod Serverless Handler — Flux Dev + Multi-LoRA inference.
+RunPod Serverless Handler — Flux 2 Dev + Multi-LoRA + ADetailer inference.
 
 No safety checker. No NSFW filter. Full control.
 
@@ -14,16 +14,18 @@ Input:
     "lora_scale": 1.0,
     "width": 768,
     "height": 1024,
-    "guidance_scale": 2.5,
-    "num_inference_steps": 28,
-    "seed": 42                                  # optional, random if omitted
+    "guidance_scale": 4.0,
+    "num_inference_steps": 50,
+    "seed": 42,                                 # optional, random if omitted
+    "adetailer": true                           # optional, run face/hand fix
 }
 
 Output:
 {
     "status": "ok",
     "image": "<base64 JPEG>",
-    "seed": 42
+    "seed": 42,
+    "adetailer": {"faces": 1, "hands": 2}      # if adetailer was run
 }
 """
 
@@ -35,25 +37,28 @@ import random
 import time
 import runpod
 import torch
-from diffusers import FluxPipeline
-import requests
+import numpy as np
+from PIL import Image, ImageFilter
 
 # ─── Globals (loaded once on cold start) ───
 pipe = None
+inpaint_pipe = None
 loaded_lora_key = None
+yolo_face = None
+yolo_hand = None
 
 
 def load_model():
-    """Load Flux Dev pipeline once. Tries network volume first, then HF Hub.
-    If loaded from HF and a network volume is mounted, saves to volume for next time."""
+    """Load Flux 2 Dev pipeline once (4-bit quantized).
+    Tries network volume first, then HF Hub."""
     global pipe
     if pipe is not None:
         return
 
-    print("[TGND] Loading Flux Dev pipeline...")
+    print("[TGND] Loading Flux 2 Dev pipeline (4-bit)...")
     t0 = time.time()
 
-    volume_path = "/runpod-volume/flux-dev"
+    volume_path = "/runpod-volume/flux2-dev"
     volume_mounted = os.path.exists("/runpod-volume")
     saved_to_volume = False
 
@@ -65,11 +70,13 @@ def load_model():
         if hf_token:
             from huggingface_hub import login
             login(token=hf_token)
-        model_source = "black-forest-labs/FLUX.1-dev"
-        print("[TGND] Downloading from HuggingFace Hub...")
-        saved_to_volume = volume_mounted  # will save after loading
+        model_source = "diffusers/FLUX.2-dev-bnb-4bit"
+        print("[TGND] Downloading 4-bit model from HuggingFace Hub...")
+        saved_to_volume = volume_mounted
 
-    pipe = FluxPipeline.from_pretrained(
+    from diffusers import Flux2Pipeline
+
+    pipe = Flux2Pipeline.from_pretrained(
         model_source,
         torch_dtype=torch.bfloat16,
     )
@@ -81,11 +88,140 @@ def load_model():
             print(f"[TGND] Saving model to network volume: {volume_path}")
             os.makedirs(volume_path, exist_ok=True)
             pipe.save_pretrained(volume_path)
-            print(f"[TGND] Model saved to volume!")
+            print("[TGND] Model saved to volume!")
         except Exception as e:
             print(f"[TGND] Could not save to volume: {e}")
 
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s")
+
+
+def load_inpaint_pipe():
+    """Create inpaint pipeline from the main pipeline (shares weights, no extra VRAM)."""
+    global inpaint_pipe
+    if inpaint_pipe is not None:
+        return
+
+    try:
+        from diffusers import FluxInpaintPipeline
+        inpaint_pipe = FluxInpaintPipeline.from_pipe(pipe)
+        print("[TGND] Inpaint pipeline created from main pipe (shared weights)")
+    except Exception as e:
+        print(f"[TGND] Could not create inpaint pipeline: {e}")
+        inpaint_pipe = False  # sentinel: tried and failed
+
+
+def load_yolo_models():
+    """Load YOLO face and hand detection models for ADetailer."""
+    global yolo_face, yolo_hand
+    if yolo_face is not None:
+        return
+
+    try:
+        from ultralytics import YOLO
+        from huggingface_hub import hf_hub_download
+
+        # Check volume cache first
+        yolo_dir = "/runpod-volume/yolo" if os.path.exists("/runpod-volume") else "/tmp/yolo"
+        os.makedirs(yolo_dir, exist_ok=True)
+
+        face_path = os.path.join(yolo_dir, "face_yolov9c.pt")
+        hand_path = os.path.join(yolo_dir, "hand_yolov9c.pt")
+
+        if not os.path.exists(face_path):
+            face_path = hf_hub_download("Bingsu/adetailer", "face_yolov9c.pt", local_dir=yolo_dir)
+        if not os.path.exists(hand_path):
+            hand_path = hf_hub_download("Bingsu/adetailer", "hand_yolov9c.pt", local_dir=yolo_dir)
+
+        yolo_face = YOLO(face_path)
+        yolo_hand = YOLO(hand_path)
+        print("[TGND] YOLO face+hand models loaded")
+    except Exception as e:
+        print(f"[TGND] Could not load YOLO models: {e}")
+        yolo_face = False
+        yolo_hand = False
+
+
+def create_feathered_mask(image_size, bbox, feather=20):
+    """Create a feathered mask from a bounding box [x1, y1, x2, y2]."""
+    w, h = image_size
+    mask = Image.new("L", (w, h), 0)
+
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+
+    # Expand bbox by 15% for context
+    bw, bh = x2 - x1, y2 - y1
+    expand = 0.15
+    x1 = max(0, int(x1 - bw * expand))
+    y1 = max(0, int(y1 - bh * expand))
+    x2 = min(w, int(x2 + bw * expand))
+    y2 = min(h, int(y2 + bh * expand))
+
+    # Draw white rectangle
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(mask)
+    draw.rectangle([x1, y1, x2, y2], fill=255)
+
+    # Feather the edges
+    mask = mask.filter(ImageFilter.GaussianBlur(feather))
+
+    return mask
+
+
+def run_adetailer(image, prompt, seed):
+    """Run ADetailer: detect faces/hands, inpaint fixes."""
+    load_yolo_models()
+    if yolo_face is False:
+        return image, {"skipped": "yolo_load_failed"}
+
+    load_inpaint_pipe()
+    if inpaint_pipe is False:
+        return image, {"skipped": "inpaint_pipe_failed"}
+
+    t0 = time.time()
+    img_array = np.array(image)
+    stats = {"faces": 0, "hands": 0, "fixed": 0}
+
+    # Detect faces
+    face_results = yolo_face(img_array, conf=0.3, verbose=False)
+    face_boxes = face_results[0].boxes.xyxy.cpu().numpy() if len(face_results[0].boxes) > 0 else []
+    stats["faces"] = len(face_boxes)
+
+    # Detect hands
+    hand_results = yolo_hand(img_array, conf=0.3, verbose=False)
+    hand_boxes = hand_results[0].boxes.xyxy.cpu().numpy() if len(hand_results[0].boxes) > 0 else []
+    stats["hands"] = len(hand_boxes)
+
+    all_boxes = list(face_boxes) + list(hand_boxes)
+    if not all_boxes:
+        print("[TGND] ADetailer: no faces/hands detected, skipping")
+        stats["skipped"] = "no_detections"
+        return image, stats
+
+    # Inpaint each detected region
+    generator = torch.Generator("cuda").manual_seed(seed)
+
+    for i, bbox in enumerate(all_boxes):
+        region_type = "face" if i < len(face_boxes) else "hand"
+        print(f"[TGND] ADetailer: fixing {region_type} region {bbox}")
+
+        mask = create_feathered_mask(image.size, bbox)
+
+        # Inpaint with low strength to fix artifacts while keeping consistency
+        result = inpaint_pipe(
+            prompt=prompt,
+            image=image,
+            mask_image=mask,
+            strength=0.35,
+            guidance_scale=4.0,
+            num_inference_steps=25,
+            generator=generator,
+        )
+        image = result.images[0]
+        stats["fixed"] += 1
+
+    elapsed = time.time() - t0
+    print(f"[TGND] ADetailer done in {elapsed:.1f}s: {stats}")
+    return image, stats
 
 
 def download_lora(url):
@@ -105,6 +241,7 @@ def download_lora(url):
         return tmp_cache
 
     print(f"[TGND] Downloading LoRA: {url[:80]}...")
+    import requests
     resp = requests.get(url, timeout=120)
     resp.raise_for_status()
     data = resp.content
@@ -193,14 +330,15 @@ def handler(job):
 
     adapters = load_loras(lora_configs)
 
-    # Generation params
+    # Generation params (Flux 2 defaults: guidance=4, steps=50)
     width = int(inp.get("width", 768))
     height = int(inp.get("height", 1024))
-    guidance_scale = float(inp.get("guidance_scale", 2.5))
-    num_steps = int(inp.get("num_inference_steps", 28))
+    guidance_scale = float(inp.get("guidance_scale", 4.0))
+    num_steps = int(inp.get("num_inference_steps", 50))
     seed = int(inp.get("seed", random.randint(1, 2147483647)))
+    use_adetailer = bool(inp.get("adetailer", False))
 
-    print(f"[TGND] Generating {width}x{height}, steps={num_steps}, guidance={guidance_scale}, seed={seed}")
+    print(f"[TGND] Generating {width}x{height}, steps={num_steps}, guidance={guidance_scale}, seed={seed}, adetailer={use_adetailer}")
     t0 = time.time()
 
     generator = torch.Generator("cuda").manual_seed(seed)
@@ -219,6 +357,13 @@ def handler(job):
     )
 
     image = result.images[0]
+    gen_elapsed = time.time() - t0
+    print(f"[TGND] Generated in {gen_elapsed:.1f}s")
+
+    # ADetailer post-processing
+    adetailer_stats = None
+    if use_adetailer:
+        image, adetailer_stats = run_adetailer(image, prompt, seed)
 
     # Encode to JPEG base64
     buf = io.BytesIO()
@@ -226,14 +371,18 @@ def handler(job):
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
 
     elapsed = time.time() - t0
-    print(f"[TGND] Generated in {elapsed:.1f}s, size={len(b64) // 1024}KB")
+    print(f"[TGND] Total time {elapsed:.1f}s, size={len(b64) // 1024}KB")
 
-    return {
+    response = {
         "status": "ok",
         "image": b64,
         "seed": seed,
         "inference_time": round(elapsed, 2),
     }
+    if adetailer_stats:
+        response["adetailer"] = adetailer_stats
+
+    return response
 
 
 # ─── RunPod entry point ───
