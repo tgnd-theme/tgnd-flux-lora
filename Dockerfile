@@ -7,10 +7,11 @@ RUN pip install --no-cache-dir \
     torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Install Python dependencies with pinned versions for torch 2.6 compat
-# Key: transformers<4.52 to avoid float8_e8m0fnu requirement (torch 2.7+)
+# diffusers>=0.38.0 needed for Flux2Pipeline
+# transformers<4.52 to avoid float8_e8m0fnu requirement (torch 2.7+)
 RUN pip install --no-cache-dir \
     runpod \
-    'diffusers>=0.31.0,<0.39.0' \
+    'diffusers>=0.38.0,<0.42.0' \
     'transformers>=4.44.0,<4.52.0' \
     accelerate \
     safetensors \

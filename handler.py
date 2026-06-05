@@ -1,5 +1,5 @@
 """
-RunPod Serverless Handler — Flux.1 Dev + Multi-LoRA + ADetailer inference.
+RunPod Serverless Handler — Flux 2 Dev + Multi-LoRA + ADetailer inference.
 
 No safety checker. No NSFW filter. Full control.
 """
@@ -45,26 +45,38 @@ yolo_hand = None
 
 
 def load_model():
-    """Load Flux.1 Dev pipeline once (4-bit quantized via bitsandbytes).
+    """Load Flux 2 Dev pipeline once (4-bit quantized via bitsandbytes).
     Tries network volume first, then HF Hub."""
     global pipe
     if pipe is not None:
         return
 
-    print("[TGND] Loading Flux.1 Dev pipeline (4-bit)...", flush=True)
+    print("[TGND] Loading Flux 2 Dev pipeline (4-bit)...", flush=True)
     t0 = time.time()
 
-    from diffusers import FluxPipeline, FluxTransformer2DModel, BitsAndBytesConfig
+    from diffusers import BitsAndBytesConfig
 
-    volume_path = "/runpod-volume/flux-dev"
+    # Try Flux 2 pipeline first, fall back to Flux 1
+    try:
+        from diffusers import Flux2Pipeline, FluxTransformer2DModel
+        pipeline_cls = Flux2Pipeline
+        model_id = "black-forest-labs/FLUX.2-dev"
+        volume_path = "/runpod-volume/flux2-dev"
+        print("[TGND] Using Flux2Pipeline", flush=True)
+    except ImportError:
+        from diffusers import FluxPipeline, FluxTransformer2DModel
+        pipeline_cls = FluxPipeline
+        model_id = "black-forest-labs/FLUX.1-dev"
+        volume_path = "/runpod-volume/flux-dev"
+        print("[TGND] Flux2Pipeline not available, falling back to FluxPipeline", flush=True)
+
     volume_mounted = os.path.exists("/runpod-volume")
     saved_to_volume = False
-    model_id = "black-forest-labs/FLUX.1-dev"
 
     if os.path.exists(volume_path) and os.listdir(volume_path):
         print(f"[TGND] Loading from network volume: {volume_path}", flush=True)
         model_source = volume_path
-        pipe = FluxPipeline.from_pretrained(
+        pipe = pipeline_cls.from_pretrained(
             model_source,
             torch_dtype=torch.bfloat16,
         )
@@ -88,7 +100,7 @@ def load_model():
             quantization_config=nf4_config,
             torch_dtype=torch.bfloat16,
         )
-        pipe = FluxPipeline.from_pretrained(
+        pipe = pipeline_cls.from_pretrained(
             model_id,
             transformer=transformer,
             torch_dtype=torch.bfloat16,
@@ -226,7 +238,7 @@ def run_adetailer(image, prompt, seed):
             image=image,
             mask_image=mask,
             strength=0.35,
-            guidance_scale=3.5,
+            guidance_scale=4.0,
             num_inference_steps=25,
             generator=generator,
         )
@@ -238,8 +250,17 @@ def run_adetailer(image, prompt, seed):
     return image, stats
 
 
-def download_lora(url):
-    """Download LoRA file, using network volume or /tmp cache."""
+def download_lora(url_or_path):
+    """Download LoRA file, using local path, network volume, or /tmp cache."""
+    # Check if it's a local volume path first
+    if url_or_path.startswith("/runpod-volume/"):
+        if os.path.exists(url_or_path):
+            print(f"[TGND] LoRA from local path: {url_or_path}", flush=True)
+            return url_or_path
+        else:
+            print(f"[TGND] WARNING: Local LoRA path not found: {url_or_path}", flush=True)
+
+    url = url_or_path
     url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
 
     # Check network volume cache first (persists across cold starts)
@@ -345,11 +366,11 @@ def handler(job):
 
         adapters = load_loras(lora_configs)
 
-        # Generation params (Flux 1 defaults: guidance=3.5, steps=28)
+        # Generation params (Flux 2 defaults: guidance=4.0, steps=50)
         width = int(inp.get("width", 768))
         height = int(inp.get("height", 1024))
-        guidance_scale = float(inp.get("guidance_scale", 3.5))
-        num_steps = int(inp.get("num_inference_steps", 28))
+        guidance_scale = float(inp.get("guidance_scale", 4.0))
+        num_steps = int(inp.get("num_inference_steps", 50))
         seed = int(inp.get("seed", random.randint(1, 2147483647)))
         use_adetailer = bool(inp.get("adetailer", False))
 
