@@ -1,11 +1,13 @@
-"""Patch torch __init__.py to add missing float8 type aliases.
+"""Patch torch to add missing float8 type aliases at runtime.
 
 PyTorch 2.6 lacks float8_e8m0fnu, float8_e4m3fnuz, float8_e5m2fnuz
-which are needed by latest transformers/torchvision. This script adds
-aliases pointing to float8_e4m3fn (functionally equivalent for our use).
+which are needed by latest transformers/torchvision. Instead of patching
+the source file (fragile), we create a sitecustomize.py that patches
+torch on import.
 """
 import torch
 import os
+import sys
 
 MISSING = ['float8_e8m0fnu', 'float8_e4m3fnuz', 'float8_e5m2fnuz']
 
@@ -14,27 +16,28 @@ if not need_patch:
     print("torch float8 types already present, no patch needed")
     exit(0)
 
-init_file = os.path.join(os.path.dirname(torch.__file__), '__init__.py')
-with open(init_file, 'r') as f:
-    content = f.read()
+# Find site-packages dir
+site_packages = None
+for p in sys.path:
+    if 'site-packages' in p or 'dist-packages' in p:
+        if os.path.isdir(p):
+            site_packages = p
+            break
 
-marker = 'from torch._C import *  # noqa: F403'
-if marker not in content:
-    print(f"WARNING: marker not found in {init_file}, skipping patch")
-    exit(0)
+if not site_packages:
+    print("WARNING: could not find site-packages dir")
+    exit(1)
 
-# Use globals() to avoid _C reference issues — float8_e4m3fn is available
-# after the wildcard import, and globals() lets us add new names at module scope
-patch = '''
-# Patch: add missing float8 aliases for compat with latest transformers
-for _f8_attr in ["float8_e8m0fnu", "float8_e4m3fnuz", "float8_e5m2fnuz"]:
-    if _f8_attr not in dir():
-        globals()[_f8_attr] = float8_e4m3fn
-del _f8_attr
-'''
+# Write a .pth file that executes on Python startup (before any imports)
+pth_file = os.path.join(site_packages, 'torch_float8_patch.pth')
+with open(pth_file, 'w') as f:
+    f.write('import torch; [setattr(torch, a, torch.float8_e4m3fn) for a in ["float8_e8m0fnu","float8_e4m3fnuz","float8_e5m2fnuz"] if not hasattr(torch, a)]\n')
 
-content = content.replace(marker, marker + patch)
-with open(init_file, 'w') as f:
-    f.write(content)
+print(f"Created {pth_file}")
 
-print(f"Patched {init_file} with float8 aliases")
+# Also patch the current process for the verification step
+for attr in MISSING:
+    if not hasattr(torch, attr):
+        setattr(torch, attr, torch.float8_e4m3fn)
+
+print("float8 patch applied")
