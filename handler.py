@@ -1,5 +1,5 @@
 """
-RunPod Serverless Handler — Flux 2 Dev + Multi-LoRA + ADetailer inference.
+RunPod Serverless Handler — Flux.1 Dev + Multi-LoRA + ADetailer inference.
 
 No safety checker. No NSFW filter. Full control.
 
@@ -14,8 +14,8 @@ Input:
     "lora_scale": 1.0,
     "width": 768,
     "height": 1024,
-    "guidance_scale": 4.0,
-    "num_inference_steps": 50,
+    "guidance_scale": 3.5,
+    "num_inference_steps": 28,
     "seed": 42,                                 # optional, random if omitted
     "adetailer": true                           # optional, run face/hand fix
 }
@@ -49,37 +49,55 @@ yolo_hand = None
 
 
 def load_model():
-    """Load Flux 2 Dev pipeline once (4-bit quantized).
+    """Load Flux.1 Dev pipeline once (4-bit quantized via bitsandbytes).
     Tries network volume first, then HF Hub."""
     global pipe
     if pipe is not None:
         return
 
-    print("[TGND] Loading Flux 2 Dev pipeline (4-bit)...")
+    print("[TGND] Loading Flux.1 Dev pipeline (4-bit)...")
     t0 = time.time()
 
-    volume_path = "/runpod-volume/flux2-dev"
+    from diffusers import FluxPipeline, FluxTransformer2DModel, BitsAndBytesConfig
+
+    volume_path = "/runpod-volume/flux-dev"
     volume_mounted = os.path.exists("/runpod-volume")
     saved_to_volume = False
+    model_id = "black-forest-labs/FLUX.1-dev"
 
     if os.path.exists(volume_path) and os.listdir(volume_path):
         print(f"[TGND] Loading from network volume: {volume_path}")
         model_source = volume_path
+        pipe = FluxPipeline.from_pretrained(
+            model_source,
+            torch_dtype=torch.bfloat16,
+        )
     else:
         hf_token = os.environ.get("HF_TOKEN", "")
         if hf_token:
             from huggingface_hub import login
             login(token=hf_token)
-        model_source = "diffusers/FLUX.2-dev-bnb-4bit"
-        print("[TGND] Downloading 4-bit model from HuggingFace Hub...")
+
+        print("[TGND] Loading model with NF4 quantization from HF Hub...")
         saved_to_volume = volume_mounted
 
-    from diffusers import Flux2Pipeline
+        nf4_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        transformer = FluxTransformer2DModel.from_pretrained(
+            model_id,
+            subfolder="transformer",
+            quantization_config=nf4_config,
+            torch_dtype=torch.bfloat16,
+        )
+        pipe = FluxPipeline.from_pretrained(
+            model_id,
+            transformer=transformer,
+            torch_dtype=torch.bfloat16,
+        )
 
-    pipe = Flux2Pipeline.from_pretrained(
-        model_source,
-        torch_dtype=torch.bfloat16,
-    )
     pipe.enable_model_cpu_offload()
 
     # Cache to network volume for faster future cold starts
@@ -330,11 +348,11 @@ def handler(job):
 
     adapters = load_loras(lora_configs)
 
-    # Generation params (Flux 2 defaults: guidance=4, steps=50)
+    # Generation params (Flux 1 defaults: guidance=3.5, steps=28)
     width = int(inp.get("width", 768))
     height = int(inp.get("height", 1024))
-    guidance_scale = float(inp.get("guidance_scale", 4.0))
-    num_steps = int(inp.get("num_inference_steps", 50))
+    guidance_scale = float(inp.get("guidance_scale", 3.5))
+    num_steps = int(inp.get("num_inference_steps", 28))
     seed = int(inp.get("seed", random.randint(1, 2147483647)))
     use_adetailer = bool(inp.get("adetailer", False))
 

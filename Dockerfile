@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir \
     opencv-python-headless>=4.10.0
 
 # Model weights are loaded at runtime from either:
-# 1. RunPod Network Volume (/runpod-volume/flux2-dev/)
+# 1. RunPod Network Volume (/runpod-volume/flux-dev/)
 # 2. HuggingFace Hub (fallback, requires HF_TOKEN env var)
 
 # Copy handler
