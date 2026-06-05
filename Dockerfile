@@ -1,9 +1,13 @@
-FROM runpod/pytorch:2.6.0-py3.12-cuda12.6.3-devel-ubuntu22.04
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /app
 
-# Install Python dependencies (--upgrade to override base image versions)
-RUN pip install --no-cache-dir --upgrade \
+# Upgrade torch first (base has 2.4, need 2.6 for diffusers compat)
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
     runpod \
     diffusers \
     transformers \
