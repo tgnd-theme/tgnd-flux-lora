@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install Python dependencies
 RUN pip install --no-cache-dir \
-    runpod==1.7.4 \
+    runpod>=1.7.4 \
     diffusers>=0.38.0 \
     transformers>=4.48.0 \
     accelerate>=1.2.0 \
