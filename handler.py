@@ -51,24 +51,21 @@ def load_model():
     if pipe is not None:
         return
 
-    print("[TGND] Loading Flux 2 Dev pipeline (4-bit)...", flush=True)
+    print("[TGND] Loading Flux Dev pipeline (4-bit)...", flush=True)
     t0 = time.time()
 
     from diffusers import BitsAndBytesConfig
 
-    # Try Flux 2 pipeline first, fall back to Flux 1
-    try:
-        from diffusers import Flux2Pipeline, FluxTransformer2DModel
-        pipeline_cls = Flux2Pipeline
-        model_id = "black-forest-labs/FLUX.2-dev"
-        volume_path = "/runpod-volume/flux2-dev"
-        print("[TGND] Using Flux2Pipeline", flush=True)
-    except ImportError:
-        from diffusers import FluxPipeline, FluxTransformer2DModel
-        pipeline_cls = FluxPipeline
-        model_id = "black-forest-labs/FLUX.1-dev"
-        volume_path = "/runpod-volume/flux-dev"
-        print("[TGND] Flux2Pipeline not available, falling back to FluxPipeline", flush=True)
+    # Use Flux 1 Dev (stable, cached on volume)
+    # Flux 2 can be enabled later once HF license is accepted:
+    #   change model_id to "black-forest-labs/FLUX.2-dev"
+    #   change volume_path to "/runpod-volume/flux2-dev"
+    #   change FluxPipeline to Flux2Pipeline
+    from diffusers import FluxPipeline, FluxTransformer2DModel
+    pipeline_cls = FluxPipeline
+    model_id = "black-forest-labs/FLUX.1-dev"
+    volume_path = "/runpod-volume/flux-dev"
+    print(f"[TGND] Using FluxPipeline, model={model_id}", flush=True)
 
     volume_mounted = os.path.exists("/runpod-volume")
     saved_to_volume = False
