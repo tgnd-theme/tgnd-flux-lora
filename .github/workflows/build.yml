@@ -43,5 +43,4 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             org.opencontainers.image.description=TGND Flux LoRA inference handler for RunPod
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          provenance: false
