@@ -2,15 +2,16 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
 WORKDIR /app
 
-# Upgrade torch first (base has 2.4, need 2.6 for diffusers compat)
+# Upgrade torch (base has 2.4, need >=2.5 for diffusers FluxPipeline)
 RUN pip install --no-cache-dir \
     torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
-# Install Python dependencies
+# Install Python dependencies with pinned versions for torch 2.6 compat
+# Key: transformers<4.52 to avoid float8_e8m0fnu requirement (torch 2.7+)
 RUN pip install --no-cache-dir \
     runpod \
-    diffusers \
-    transformers \
+    'diffusers>=0.31.0,<0.39.0' \
+    'transformers>=4.44.0,<4.52.0' \
     accelerate \
     safetensors \
     sentencepiece \
@@ -22,10 +23,6 @@ RUN pip install --no-cache-dir \
     bitsandbytes \
     ultralytics \
     opencv-python-headless
-
-# Patch missing float8 types (added in PyTorch 2.7, not in 2.6)
-COPY patch_torch_float8.py /tmp/patch_torch_float8.py
-RUN python3 /tmp/patch_torch_float8.py
 
 # Verify critical imports work at build time
 RUN python3 -c "from transformers import CLIPImageProcessor; from diffusers import FluxPipeline; print('All imports OK')"
