@@ -23,11 +23,14 @@ if marker not in content:
     print(f"WARNING: marker not found in {init_file}, skipping patch")
     exit(0)
 
+# Use globals() to avoid _C reference issues — float8_e4m3fn is available
+# after the wildcard import, and globals() lets us add new names at module scope
 patch = '''
 # Patch: add missing float8 aliases for compat with latest transformers
-for _attr in ["float8_e8m0fnu", "float8_e4m3fnuz", "float8_e5m2fnuz"]:
-    if not hasattr(_C, _attr):
-        setattr(_C, _attr, float8_e4m3fn)
+for _f8_attr in ["float8_e8m0fnu", "float8_e4m3fnuz", "float8_e5m2fnuz"]:
+    if _f8_attr not in dir():
+        globals()[_f8_attr] = float8_e4m3fn
+del _f8_attr
 '''
 
 content = content.replace(marker, marker + patch)
