@@ -23,6 +23,29 @@ RUN pip install --no-cache-dir \
     ultralytics \
     opencv-python-headless
 
+# Patch missing float8 types (added in PyTorch 2.7, not in 2.6)
+RUN python3 -c "\
+import torch; \
+patch = False; \
+for attr in ['float8_e8m0fnu', 'float8_e4m3fnuz', 'float8_e5m2fnuz']: \
+    if not hasattr(torch, attr): \
+        patch = True; break; \
+if patch: \
+    import torch as _t; \
+    init = _t.__file__.replace('__init__.py', '') + '__init__.py'; \
+    with open(init, 'r') as f: lines = f.readlines(); \
+    marker = 'from torch._C import *  # noqa: F403'; \
+    new_lines = []; \
+    for line in lines: \
+        new_lines.append(line); \
+        if marker in line: \
+            new_lines.append('# Patch: add missing float8 aliases for compat with latest transformers\n'); \
+            new_lines.append('for _attr in [\"float8_e8m0fnu\", \"float8_e4m3fnuz\", \"float8_e5m2fnuz\"]:\n'); \
+            new_lines.append('    if not hasattr(_C, _attr): setattr(_C, _attr, float8_e4m3fn)\n'); \
+    with open(init, 'w') as f: f.writelines(new_lines); \
+    print('Patched torch __init__.py with float8 aliases'); \
+"
+
 # Verify critical imports work at build time
 RUN python3 -c "\
 from transformers import CLIPImageProcessor; \
