@@ -6,12 +6,31 @@ jobs:
   make-public:
     runs-on: ubuntu-latest
     steps:
-      - name: Make package public
+      - name: Make package public via org API
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl -X PATCH \
-            -H "Authorization: Bearer $GH_TOKEN" \
+          # Try multiple API paths
+          echo "=== Try /users path ==="
+          curl -sX PATCH \
+            -H "Authorization: token $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/user/packages/container/tgnd-flux-lora" \
+            "https://api.github.com/users/tgnd-theme/packages/container/tgnd-flux-lora" \
             -d '{"visibility":"public"}'
+          
+          echo ""
+          echo "=== Try /orgs path ==="
+          curl -sX PATCH \
+            -H "Authorization: token $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/orgs/tgnd-theme/packages/container/tgnd-flux-lora" \
+            -d '{"visibility":"public"}'
+          
+          echo ""
+          echo "=== Try login to ghcr.io ==="
+          echo $GH_TOKEN | docker login ghcr.io -u tgnd-theme --password-stdin
+          
+          echo ""
+          echo "=== Pull and push to Docker Hub as public ==="
+          docker pull ghcr.io/tgnd-theme/tgnd-flux-lora:a15089c47be6bee31274020b76429c231f9c5295
+          docker tag ghcr.io/tgnd-theme/tgnd-flux-lora:a15089c47be6bee31274020b76429c231f9c5295 ghcr.io/tgnd-theme/tgnd-flux-lora:latest
