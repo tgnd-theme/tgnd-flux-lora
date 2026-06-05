@@ -23,6 +23,14 @@ RUN pip install --no-cache-dir \
     ultralytics \
     opencv-python-headless
 
+# Verify critical imports work at build time
+RUN python3 -c "\
+from transformers import CLIPImageProcessor; \
+from diffusers import FluxPipeline, FluxTransformer2DModel, BitsAndBytesConfig; \
+print('All imports OK'); \
+import transformers, diffusers, torch; \
+print(f'torch={torch.__version__} transformers={transformers.__version__} diffusers={diffusers.__version__}')"
+
 # Model weights are loaded at runtime from either:
 # 1. RunPod Network Volume (/runpod-volume/flux-dev/)
 # 2. HuggingFace Hub (fallback, requires HF_TOKEN env var)
