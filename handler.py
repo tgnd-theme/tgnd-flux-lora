@@ -67,42 +67,25 @@ def load_model():
         from huggingface_hub import login
         login(token=hf_token)
 
-    if os.path.exists(volume_path) and os.listdir(volume_path):
-        print(f"[TGND] Loading from network volume: {volume_path}", flush=True)
-        pipe = Flux2Pipeline.from_pretrained(
-            volume_path,
-            torch_dtype=torch.bfloat16,
-        )
-        pipe.enable_model_cpu_offload()
-    else:
-        print("[TGND] Loading Flux 2 Dev with NF4 quantization from HF Hub...", flush=True)
+    # Always load from HF Hub with NF4 quantization (quantized models can't be saved/loaded from volume)
+    print("[TGND] Loading Flux 2 Dev with NF4 quantization from HF Hub...", flush=True)
 
-        # Quantize transformer only (biggest component) — NF4 reduces ~60GB to ~16GB
-        quant_config = PipelineQuantizationConfig(
-            quant_backend="bitsandbytes_4bit",
-            quant_kwargs={
-                "load_in_4bit": True,
-                "bnb_4bit_quant_type": "nf4",
-                "bnb_4bit_compute_dtype": torch.bfloat16,
-            },
-            components_to_quantize=["transformer"],
-        )
-        pipe = Flux2Pipeline.from_pretrained(
-            model_id,
-            quantization_config=quant_config,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-        )
-
-        # Cache to network volume for faster future cold starts
-        if volume_mounted:
-            try:
-                print(f"[TGND] Saving model to network volume: {volume_path}", flush=True)
-                os.makedirs(volume_path, exist_ok=True)
-                pipe.save_pretrained(volume_path)
-                print("[TGND] Model saved to volume!", flush=True)
-            except Exception as e:
-                print(f"[TGND] Could not save to volume: {e}", flush=True)
+    # Quantize transformer only (biggest component) — NF4 reduces ~60GB to ~16GB
+    quant_config = PipelineQuantizationConfig(
+        quant_backend="bitsandbytes_4bit",
+        quant_kwargs={
+            "load_in_4bit": True,
+            "bnb_4bit_quant_type": "nf4",
+            "bnb_4bit_compute_dtype": torch.bfloat16,
+        },
+        components_to_quantize=["transformer"],
+    )
+    pipe = Flux2Pipeline.from_pretrained(
+        model_id,
+        quantization_config=quant_config,
+        torch_dtype=torch.bfloat16,
+        device_map="balanced",
+    )
 
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s", flush=True)
 
