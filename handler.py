@@ -56,16 +56,12 @@ def load_model():
 
     from diffusers import BitsAndBytesConfig
 
-    # Use Flux 1 Dev (stable, cached on volume)
-    # Flux 2 can be enabled later once HF license is accepted:
-    #   change model_id to "black-forest-labs/FLUX.2-dev"
-    #   change volume_path to "/runpod-volume/flux2-dev"
-    #   change FluxPipeline to Flux2Pipeline
+    # Flux 2 Dev (32B params, NF4 quantized ~16GB VRAM)
     from diffusers import FluxPipeline, FluxTransformer2DModel
     pipeline_cls = FluxPipeline
-    model_id = "black-forest-labs/FLUX.1-dev"
-    volume_path = "/runpod-volume/flux-dev"
-    print(f"[TGND] Using FluxPipeline, model={model_id}", flush=True)
+    model_id = "black-forest-labs/FLUX.2-dev"
+    volume_path = "/runpod-volume/flux2-dev"
+    print(f"[TGND] Using FluxPipeline (Flux 2 Dev), model={model_id}", flush=True)
 
     volume_mounted = os.path.exists("/runpod-volume")
     saved_to_volume = False
