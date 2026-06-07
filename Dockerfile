@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir \
     opencv-python-headless
 
 # Verify critical imports work at build time
-RUN python3 -c "from diffusers import Flux2Pipeline; from transformers import Mistral3ForConditionalGeneration; print('All Flux 2 imports OK')"
+RUN python3 -c "from diffusers import Flux2Pipeline, PipelineQuantizationConfig; print('All Flux 2 imports OK')"
 
 # Model weights are loaded at runtime from either:
 # 1. RunPod Network Volume (/runpod-volume/flux-dev/)
