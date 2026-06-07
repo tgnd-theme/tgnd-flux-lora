@@ -86,17 +86,22 @@ def load_model():
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-        # Load full pipeline with quantization config (not just transformer)
-        pipe = pipeline_cls.from_pretrained(
+        # Load transformer separately with quantization, then inject into pipeline
+        transformer = FluxTransformer2DModel.from_pretrained(
             model_id,
+            subfolder="transformer",
             quantization_config=nf4_config,
             torch_dtype=torch.bfloat16,
-            device_map="balanced",
+        )
+        pipe = pipeline_cls.from_pretrained(
+            model_id,
+            transformer=transformer,
+            torch_dtype=torch.bfloat16,
         )
 
-    # CPU offload only if not using device_map
-    if not hasattr(pipe, 'hf_device_map'):
-        pipe.enable_model_cpu_offload()
+    # Move to GPU — with NF4 quantization, Flux 2 fits in ~16GB VRAM
+    # Don't use CPU offload with quantized models (causes meta tensor errors)
+    pipe.to("cuda")
 
     # Cache to network volume for faster future cold starts
     if saved_to_volume:
