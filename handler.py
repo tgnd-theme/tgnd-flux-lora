@@ -54,11 +54,7 @@ def load_model():
     print("[TGND] Loading Flux Dev pipeline (4-bit)...", flush=True)
     t0 = time.time()
 
-    from diffusers import BitsAndBytesConfig
-
-    # Flux 2 Dev (32B params, NF4 quantized ~16GB VRAM)
-    from diffusers import FluxPipeline, FluxTransformer2DModel
-    pipeline_cls = FluxPipeline
+    from diffusers import FluxPipeline, PipelineQuantizationConfig
     model_id = "black-forest-labs/FLUX.2-dev"
     volume_path = "/runpod-volume/flux2-dev"
     print(f"[TGND] Using FluxPipeline (Flux 2 Dev), model={model_id}", flush=True)
@@ -73,7 +69,7 @@ def load_model():
 
     if os.path.exists(volume_path) and os.listdir(volume_path):
         print(f"[TGND] Loading from network volume: {volume_path}", flush=True)
-        pipe = pipeline_cls.from_pretrained(
+        pipe = FluxPipeline.from_pretrained(
             volume_path,
             torch_dtype=torch.bfloat16,
         )
@@ -81,26 +77,23 @@ def load_model():
         print("[TGND] Loading Flux 2 with NF4 quantization from HF Hub...", flush=True)
         saved_to_volume = volume_mounted
 
-        nf4_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
+        # Use PipelineQuantizationConfig for pipeline-level quantization
+        quant_config = PipelineQuantizationConfig(
+            quant_backend="bitsandbytes_4bit",
+            quant_kwargs={
+                "load_in_4bit": True,
+                "bnb_4bit_quant_type": "nf4",
+                "bnb_4bit_compute_dtype": torch.bfloat16,
+            },
+            components_to_quantize=["transformer"],
         )
-        # Load transformer separately with quantization, then inject into pipeline
-        transformer = FluxTransformer2DModel.from_pretrained(
+        pipe = FluxPipeline.from_pretrained(
             model_id,
-            subfolder="transformer",
-            quantization_config=nf4_config,
-            torch_dtype=torch.bfloat16,
-        )
-        pipe = pipeline_cls.from_pretrained(
-            model_id,
-            transformer=transformer,
+            quantization_config=quant_config,
             torch_dtype=torch.bfloat16,
         )
 
     # Move to GPU — with NF4 quantization, Flux 2 fits in ~16GB VRAM
-    # Don't use CPU offload with quantized models (causes meta tensor errors)
     pipe.to("cuda")
 
     # Cache to network volume for faster future cold starts
