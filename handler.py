@@ -57,7 +57,7 @@ def load_model():
     from diffusers import Flux2Pipeline, BitsAndBytesConfig, PipelineQuantizationConfig
 
     model_id = "black-forest-labs/FLUX.2-dev"
-    volume_path = "/runpod-volume/flux2-dev"
+    volume_path = "/runpod-volume/flux2-dev-nf4"
     print(f"[TGND] Using Flux2Pipeline (Flux 2 Dev), model={model_id}", flush=True)
 
     volume_mounted = os.path.exists("/runpod-volume")
