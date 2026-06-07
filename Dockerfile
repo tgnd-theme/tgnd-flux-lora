@@ -7,12 +7,12 @@ RUN pip install --no-cache-dir \
     torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Install Python dependencies
-# diffusers from source needed for Flux2Pipeline (FLUX.2-dev)
-# transformers needs Mistral3 support for Flux 2 text encoder
+# diffusers 0.38.0+ has Flux2Pipeline (FLUX.2-dev)
+# transformers 4.50+ has Mistral3, <4.52 avoids float8_e8m0fnu (torch 2.7 req)
 RUN pip install --no-cache-dir \
     runpod \
-    git+https://github.com/huggingface/diffusers \
-    'transformers>=4.48.0' \
+    'diffusers>=0.38.0' \
+    'transformers>=4.50.0,<4.52.0' \
     accelerate \
     safetensors \
     sentencepiece \
