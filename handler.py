@@ -54,11 +54,13 @@ def load_model():
     print("[TGND] Loading Flux 2 Dev pipeline (pre-quantized NF4)...", flush=True)
     t0 = time.time()
 
-    from diffusers import FluxPipeline
-    # Use pre-quantized model from HF — much smaller download (~34GB vs ~64GB)
+    from diffusers import Flux2Pipeline, Flux2Transformer2DModel
+    from transformers import Mistral3ForConditionalGeneration
+
+    # Pre-quantized NF4 model (~34GB, fits on 24GB+ GPUs)
     model_id = "diffusers/FLUX.2-dev-bnb-4bit"
     volume_path = "/runpod-volume/flux2-dev-bnb-4bit"
-    print(f"[TGND] Using FluxPipeline (Flux 2 Dev NF4), model={model_id}", flush=True)
+    print(f"[TGND] Using Flux2Pipeline (Flux 2 Dev NF4), model={model_id}", flush=True)
 
     volume_mounted = os.path.exists("/runpod-volume")
 
@@ -67,30 +69,37 @@ def load_model():
         from huggingface_hub import login
         login(token=hf_token)
 
-    if os.path.exists(volume_path) and os.listdir(volume_path):
-        print(f"[TGND] Loading from network volume: {volume_path}", flush=True)
-        pipe = FluxPipeline.from_pretrained(
-            volume_path,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-        )
-    else:
-        print("[TGND] Downloading pre-quantized Flux 2 Dev from HF Hub...", flush=True)
-        pipe = FluxPipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch.bfloat16,
-            device_map="balanced",
-        )
+    source = volume_path if (os.path.exists(volume_path) and os.listdir(volume_path)) else model_id
+    print(f"[TGND] Loading from: {source}", flush=True)
 
-        # Cache to network volume for faster future cold starts
-        if volume_mounted:
-            try:
-                print(f"[TGND] Saving model to network volume: {volume_path}", flush=True)
-                os.makedirs(volume_path, exist_ok=True)
-                pipe.save_pretrained(volume_path)
-                print("[TGND] Model saved to volume!", flush=True)
-            except Exception as e:
-                print(f"[TGND] Could not save to volume: {e}", flush=True)
+    # Load quantized components to CPU first, then use CPU offload
+    transformer = Flux2Transformer2DModel.from_pretrained(
+        source, subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",
+    )
+    text_encoder = Mistral3ForConditionalGeneration.from_pretrained(
+        source, subfolder="text_encoder",
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",
+    )
+    pipe = Flux2Pipeline.from_pretrained(
+        source,
+        transformer=transformer,
+        text_encoder=text_encoder,
+        torch_dtype=torch.bfloat16,
+    )
+    pipe.enable_model_cpu_offload()
+
+    # Cache to network volume for faster future cold starts
+    if source == model_id and volume_mounted:
+        try:
+            print(f"[TGND] Saving model to network volume: {volume_path}", flush=True)
+            os.makedirs(volume_path, exist_ok=True)
+            pipe.save_pretrained(volume_path)
+            print("[TGND] Model saved to volume!", flush=True)
+        except Exception as e:
+            print(f"[TGND] Could not save to volume: {e}", flush=True)
 
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s", flush=True)
 
@@ -102,8 +111,8 @@ def load_inpaint_pipe():
         return
 
     try:
-        from diffusers import FluxInpaintPipeline
-        inpaint_pipe = FluxInpaintPipeline.from_pipe(pipe)
+        from diffusers import Flux2InpaintPipeline
+        inpaint_pipe = Flux2InpaintPipeline.from_pipe(pipe)
         print("[TGND] Inpaint pipeline created from main pipe (shared weights)", flush=True)
     except Exception as e:
         print(f"[TGND] Could not create inpaint pipeline: {e}", flush=True)

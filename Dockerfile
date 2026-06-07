@@ -6,13 +6,13 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
-# Install Python dependencies with pinned versions for torch 2.6 compat
-# diffusers>=0.38.0 needed for Flux2Pipeline
-# transformers<4.52 to avoid float8_e8m0fnu requirement (torch 2.7+)
+# Install Python dependencies
+# diffusers from source needed for Flux2Pipeline (FLUX.2-dev)
+# transformers needs Mistral3 support for Flux 2 text encoder
 RUN pip install --no-cache-dir \
     runpod \
-    'diffusers>=0.38.0' \
-    'transformers>=4.44.0,<4.52.0' \
+    git+https://github.com/huggingface/diffusers \
+    'transformers>=4.48.0' \
     accelerate \
     safetensors \
     sentencepiece \
@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir \
     opencv-python-headless
 
 # Verify critical imports work at build time
-RUN python3 -c "from transformers import CLIPImageProcessor; from diffusers import FluxPipeline; print('All imports OK')"
+RUN python3 -c "from diffusers import Flux2Pipeline; from transformers import Mistral3ForConditionalGeneration; print('All Flux 2 imports OK')"
 
 # Model weights are loaded at runtime from either:
 # 1. RunPod Network Volume (/runpod-volume/flux-dev/)
