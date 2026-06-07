@@ -51,16 +51,16 @@ def load_model():
     if pipe is not None:
         return
 
-    print("[TGND] Loading Flux Dev pipeline (4-bit)...", flush=True)
+    print("[TGND] Loading Flux 2 Dev pipeline (pre-quantized NF4)...", flush=True)
     t0 = time.time()
 
-    from diffusers import FluxPipeline, PipelineQuantizationConfig
-    model_id = "black-forest-labs/FLUX.2-dev"
-    volume_path = "/runpod-volume/flux2-dev"
-    print(f"[TGND] Using FluxPipeline (Flux 2 Dev), model={model_id}", flush=True)
+    from diffusers import FluxPipeline
+    # Use pre-quantized model from HF — much smaller download (~34GB vs ~64GB)
+    model_id = "diffusers/FLUX.2-dev-bnb-4bit"
+    volume_path = "/runpod-volume/flux2-dev-bnb-4bit"
+    print(f"[TGND] Using FluxPipeline (Flux 2 Dev NF4), model={model_id}", flush=True)
 
     volume_mounted = os.path.exists("/runpod-volume")
-    saved_to_volume = False
 
     hf_token = os.environ.get("HF_TOKEN", "")
     if hf_token:
@@ -72,41 +72,25 @@ def load_model():
         pipe = FluxPipeline.from_pretrained(
             volume_path,
             torch_dtype=torch.bfloat16,
+            device_map="balanced",
         )
     else:
-        print("[TGND] Loading Flux 2 with NF4 quantization from HF Hub...", flush=True)
-        saved_to_volume = volume_mounted
-
-        # Use PipelineQuantizationConfig for pipeline-level quantization
-        quant_config = PipelineQuantizationConfig(
-            quant_backend="bitsandbytes_4bit",
-            quant_kwargs={
-                "load_in_4bit": True,
-                "bnb_4bit_quant_type": "nf4",
-                "bnb_4bit_compute_dtype": torch.bfloat16,
-            },
-            components_to_quantize=["transformer"],
-        )
+        print("[TGND] Downloading pre-quantized Flux 2 Dev from HF Hub...", flush=True)
         pipe = FluxPipeline.from_pretrained(
             model_id,
-            quantization_config=quant_config,
             torch_dtype=torch.bfloat16,
             device_map="balanced",
         )
 
-    # Move to GPU (only needed for non-quantized volume loads)
-    if not hasattr(pipe, 'hf_device_map'):
-        pipe.to("cuda")
-
-    # Cache to network volume for faster future cold starts
-    if saved_to_volume:
-        try:
-            print(f"[TGND] Saving model to network volume: {volume_path}", flush=True)
-            os.makedirs(volume_path, exist_ok=True)
-            pipe.save_pretrained(volume_path)
-            print("[TGND] Model saved to volume!", flush=True)
-        except Exception as e:
-            print(f"[TGND] Could not save to volume: {e}", flush=True)
+        # Cache to network volume for faster future cold starts
+        if volume_mounted:
+            try:
+                print(f"[TGND] Saving model to network volume: {volume_path}", flush=True)
+                os.makedirs(volume_path, exist_ok=True)
+                pipe.save_pretrained(volume_path)
+                print("[TGND] Model saved to volume!", flush=True)
+            except Exception as e:
+                print(f"[TGND] Could not save to volume: {e}", flush=True)
 
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s", flush=True)
 
