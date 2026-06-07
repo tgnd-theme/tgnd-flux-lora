@@ -380,7 +380,7 @@ def handler(job):
             guidance_scale=guidance_scale,
             num_inference_steps=num_steps,
             generator=generator,
-            joint_attention_kwargs={"scale": lora_scale} if lora_configs else None,
+            attention_kwargs={"scale": lora_scale} if lora_configs else None,
         )
 
         image = result.images[0]
