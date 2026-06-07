@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir \
 # transformers<4.52 to avoid float8_e8m0fnu requirement (torch 2.7+)
 RUN pip install --no-cache-dir \
     runpod \
-    'diffusers>=0.38.0,<0.42.0' \
+    'diffusers>=0.38.0' \
     'transformers>=4.44.0,<4.52.0' \
     accelerate \
     safetensors \
@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir \
     requests \
     Pillow \
     peft \
-    bitsandbytes \
+    'bitsandbytes>=0.43.0' \
     ultralytics \
     opencv-python-headless
 
