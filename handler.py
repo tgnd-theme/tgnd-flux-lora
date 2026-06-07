@@ -66,20 +66,19 @@ def load_model():
     volume_mounted = os.path.exists("/runpod-volume")
     saved_to_volume = False
 
+    hf_token = os.environ.get("HF_TOKEN", "")
+    if hf_token:
+        from huggingface_hub import login
+        login(token=hf_token)
+
     if os.path.exists(volume_path) and os.listdir(volume_path):
         print(f"[TGND] Loading from network volume: {volume_path}", flush=True)
-        model_source = volume_path
         pipe = pipeline_cls.from_pretrained(
-            model_source,
+            volume_path,
             torch_dtype=torch.bfloat16,
         )
     else:
-        hf_token = os.environ.get("HF_TOKEN", "")
-        if hf_token:
-            from huggingface_hub import login
-            login(token=hf_token)
-
-        print("[TGND] Loading model with NF4 quantization from HF Hub...", flush=True)
+        print("[TGND] Loading Flux 2 with NF4 quantization from HF Hub...", flush=True)
         saved_to_volume = volume_mounted
 
         nf4_config = BitsAndBytesConfig(
@@ -87,19 +86,17 @@ def load_model():
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.bfloat16,
         )
-        transformer = FluxTransformer2DModel.from_pretrained(
-            model_id,
-            subfolder="transformer",
-            quantization_config=nf4_config,
-            torch_dtype=torch.bfloat16,
-        )
+        # Load full pipeline with quantization config (not just transformer)
         pipe = pipeline_cls.from_pretrained(
             model_id,
-            transformer=transformer,
+            quantization_config=nf4_config,
             torch_dtype=torch.bfloat16,
+            device_map="balanced",
         )
 
-    pipe.enable_model_cpu_offload()
+    # CPU offload only if not using device_map
+    if not hasattr(pipe, 'hf_device_map'):
+        pipe.enable_model_cpu_offload()
 
     # Cache to network volume for faster future cold starts
     if saved_to_volume:
