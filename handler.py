@@ -91,10 +91,12 @@ def load_model():
             model_id,
             quantization_config=quant_config,
             torch_dtype=torch.bfloat16,
+            device_map="balanced",
         )
 
-    # Move to GPU — with NF4 quantization, Flux 2 fits in ~16GB VRAM
-    pipe.to("cuda")
+    # Move to GPU (only needed for non-quantized volume loads)
+    if not hasattr(pipe, 'hf_device_map'):
+        pipe.to("cuda")
 
     # Cache to network volume for faster future cold starts
     if saved_to_volume:
