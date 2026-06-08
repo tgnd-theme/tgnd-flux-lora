@@ -107,7 +107,8 @@ def load_inpaint_pipe():
 
 
 def load_img2img_pipe():
-    """Create img2img pipeline from the main pipeline (shares weights, no extra VRAM)."""
+    """Create img2img pipeline from the main pipeline (shares weights, no extra VRAM).
+    Tries FluxImg2ImgPipeline first, falls back to None (use Flux2Pipeline native image param)."""
     global img2img_pipe
     if img2img_pipe is not None:
         return
@@ -117,8 +118,9 @@ def load_img2img_pipe():
         img2img_pipe = FluxImg2ImgPipeline.from_pipe(pipe)
         print("[TGND] Img2img pipeline created from main pipe (shared weights)", flush=True)
     except Exception as e:
-        print(f"[TGND] Could not create img2img pipeline: {e}", flush=True)
-        img2img_pipe = False  # sentinel: tried and failed
+        print(f"[TGND] FluxImg2ImgPipeline failed: {e}", flush=True)
+        print("[TGND] Will use Flux2Pipeline native image parameter instead", flush=True)
+        img2img_pipe = "native"  # sentinel: use Flux2Pipeline.image param
 
 
 def decode_input_image(b64_or_url):
@@ -388,25 +390,39 @@ def handler(job):
         attn_kwargs = {"scale": lora_scale} if lora_configs else None
 
         if is_img2img:
-            # ─── img2img mode via FluxImg2ImgPipeline ───
+            # ─── img2img mode ───
             input_image = decode_input_image(input_image_data)
             input_image = input_image.resize((width, height), Image.LANCZOS)
             print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
 
             load_img2img_pipe()
-            if img2img_pipe is False:
-                return {"status": "error", "error": "img2img pipeline not available"}
 
-            # FluxImg2ImgPipeline handles VAE encoding, noise injection, packing
-            result = img2img_pipe(
-                prompt=prompt,
-                image=input_image,
-                strength=strength,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_steps,
-                generator=generator,
-                attention_kwargs=attn_kwargs,
-            )
+            if img2img_pipe not in (False, "native"):
+                # FluxImg2ImgPipeline — strength-based control
+                print(f"[TGND] Using FluxImg2ImgPipeline (strength={strength})", flush=True)
+                result = img2img_pipe(
+                    prompt=prompt,
+                    image=input_image,
+                    strength=strength,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_steps,
+                    generator=generator,
+                    attention_kwargs=attn_kwargs,
+                )
+            else:
+                # Flux2Pipeline native image param — reference conditioning
+                # FLUX.2-dev is an edit model: image= provides reference context
+                print(f"[TGND] Using Flux2Pipeline native image param (reference conditioning)", flush=True)
+                result = pipe(
+                    prompt=prompt,
+                    image=input_image,
+                    width=width,
+                    height=height,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_steps,
+                    generator=generator,
+                    attention_kwargs=attn_kwargs,
+                )
         else:
             # ─── txt2img mode ───
             result = pipe(
