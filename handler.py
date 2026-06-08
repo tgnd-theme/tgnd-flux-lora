@@ -179,8 +179,14 @@ def prepare_img2img_latents(image, strength, num_steps, width, height, generator
 
     # Pack latents using pipeline's method if available
     if hasattr(pipe, '_pack_latents'):
-        packed = pipe._pack_latents(latents, batch_size, channels, lat_h, lat_w)
-        print(f"[TGND] Packed via pipeline: {packed.shape}", flush=True)
+        try:
+            # Flux2Pipeline._pack_latents takes just latents
+            packed = pipe._pack_latents(latents)
+            print(f"[TGND] Packed via pipeline (1 arg): {packed.shape}", flush=True)
+        except TypeError:
+            # FluxPipeline._pack_latents takes (latents, batch, ch, h, w)
+            packed = pipe._pack_latents(latents, batch_size, channels, lat_h, lat_w)
+            print(f"[TGND] Packed via pipeline (5 args): {packed.shape}", flush=True)
     else:
         # Manual Flux 2x2 patch packing
         packed = latents.reshape(batch_size, channels, lat_h // 2, 2, lat_w // 2, 2)
