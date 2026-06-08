@@ -124,15 +124,26 @@ def prepare_img2img_latents(image, strength, num_steps, width, height, generator
 
     # Encode to latent space
     with torch.no_grad():
-        latent_dist = vae.encode(img_tensor)
-        if hasattr(latent_dist, 'latent_dist'):
-            latents = latent_dist.latent_dist.sample(generator)
+        encoded = vae.encode(img_tensor)
+        # Handle different VAE output types
+        if hasattr(encoded, 'latent_dist'):
+            latents = encoded.latent_dist.sample(generator)
+        elif hasattr(encoded, 'latents'):
+            latents = encoded.latents
+        elif isinstance(encoded, tuple):
+            latents = encoded[0]
         else:
-            latents = latent_dist
+            latents = encoded
 
     # Scale
     if hasattr(vae.config, 'scaling_factor'):
         latents = latents * vae.config.scaling_factor
+
+    print(f"[TGND] VAE latents shape: {latents.shape}, ndim: {latents.ndim}", flush=True)
+
+    # Ensure 4D tensor [B, C, H, W]
+    if latents.ndim == 3:
+        latents = latents.unsqueeze(0)
 
     # Pack latents into Flux format (batch, seq_len, channels)
     # Flux uses 2x2 patches, so we need to reshape
