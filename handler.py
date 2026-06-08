@@ -111,35 +111,44 @@ def load_inpaint_pipe():
         inpaint_pipe = False  # sentinel: tried and failed
 
 
-def encode_image_to_latents(image, generator=None):
-    """Encode a PIL Image to latent space using the pipeline's VAE.
-    Returns latent tensor ready for the denoising loop."""
-    import torch
-    from PIL import Image as PILImage
+def prepare_img2img_latents(image, strength, num_steps, width, height, generator):
+    """Prepare noisy latents from an input image for Flux 2 img2img.
+    Uses flow matching: z_t = (1-t) * z_0 + t * noise."""
+    vae = pipe.vae
 
     # Preprocess image to tensor [-1, 1]
     img_tensor = torch.from_numpy(np.array(image)).float() / 255.0
-    img_tensor = img_tensor * 2.0 - 1.0  # scale to [-1, 1]
-    img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
-
-    # Move to same device/dtype as VAE
-    vae = pipe.vae
+    img_tensor = img_tensor * 2.0 - 1.0
+    img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)
     img_tensor = img_tensor.to(device=vae.device, dtype=vae.dtype)
 
-    # Encode
+    # Encode to latent space
     with torch.no_grad():
         latent_dist = vae.encode(img_tensor)
         if hasattr(latent_dist, 'latent_dist'):
             latents = latent_dist.latent_dist.sample(generator)
         else:
-            latents = latent_dist.sample(generator) if hasattr(latent_dist, 'sample') else latent_dist
+            latents = latent_dist
 
-    # Scale by VAE scaling factor
+    # Scale
     if hasattr(vae.config, 'scaling_factor'):
         latents = latents * vae.config.scaling_factor
 
-    print(f"[TGND] Encoded image to latents: {latents.shape}", flush=True)
-    return latents
+    # Pack latents into Flux format (batch, seq_len, channels)
+    # Flux uses 2x2 patches, so we need to reshape
+    batch, channels, h, w = latents.shape
+    latents = latents.reshape(batch, channels, h // 2, 2, w // 2, 2)
+    latents = latents.permute(0, 2, 4, 1, 3, 5)  # [B, h/2, w/2, C, 2, 2]
+    latents = latents.reshape(batch, (h // 2) * (w // 2), channels * 4)  # [B, seq_len, C*4]
+
+    # Flow matching: mix clean latents with noise based on strength
+    # strength=0 → original image, strength=1 → pure noise
+    noise = torch.randn_like(latents)
+    t = strength
+    noisy_latents = (1.0 - t) * latents + t * noise
+
+    print(f"[TGND] Prepared img2img latents: shape={noisy_latents.shape}, strength={strength}", flush=True)
+    return noisy_latents
 
 
 def decode_input_image(b64_or_url):
@@ -409,30 +418,17 @@ def handler(job):
         attn_kwargs = {"scale": lora_scale} if lora_configs else None
 
         if is_img2img:
-            # ─── img2img mode via latent injection ───
+            # ─── img2img mode via flow matching latent injection ───
             input_image = decode_input_image(input_image_data)
             input_image = input_image.resize((width, height), Image.LANCZOS)
             print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
 
-            # Encode image to latent space
-            image_latents = encode_image_to_latents(input_image, generator)
+            # Prepare noisy latents from input image
+            noisy_latents = prepare_img2img_latents(
+                input_image, strength, num_steps, width, height, generator
+            )
 
-            # Add noise based on strength (higher strength = more noise = more change)
-            scheduler = pipe.scheduler
-            # Calculate how many steps to skip based on strength
-            init_timestep = min(int(num_steps * strength), num_steps)
-            t_start = max(num_steps - init_timestep, 0)
-
-            # Get the noise schedule
-            scheduler.set_timesteps(num_steps)
-            timestep = scheduler.timesteps[t_start]
-
-            # Add noise to latents
-            noise = torch.randn_like(image_latents)
-            noisy_latents = scheduler.add_noise(image_latents, noise, timestep.unsqueeze(0))
-            print(f"[TGND] Added noise at timestep {timestep.item()}, skipping {t_start}/{num_steps} steps", flush=True)
-
-            # Generate from noisy latents (skip early denoising steps)
+            # Generate from noisy latents — pipeline handles scheduler/mu internally
             result = pipe(
                 prompt=prompt,
                 width=width,
