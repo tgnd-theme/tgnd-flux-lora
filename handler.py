@@ -39,6 +39,7 @@ except Exception as e:
 # ─── Globals (loaded once on cold start) ───
 pipe = None
 inpaint_pipe = None
+img2img_pipe = None
 loaded_lora_key = None
 yolo_face = None
 yolo_hand = None
@@ -108,6 +109,38 @@ def load_inpaint_pipe():
     except Exception as e:
         print(f"[TGND] Could not create inpaint pipeline: {e}", flush=True)
         inpaint_pipe = False  # sentinel: tried and failed
+
+
+def load_img2img_pipe():
+    """Create img2img pipeline from the main pipeline (shares weights, no extra VRAM)."""
+    global img2img_pipe
+    if img2img_pipe is not None:
+        return
+
+    try:
+        try:
+            from diffusers import Flux2Img2ImgPipeline
+            img2img_pipe = Flux2Img2ImgPipeline.from_pipe(pipe)
+        except ImportError:
+            from diffusers import FluxImg2ImgPipeline
+            img2img_pipe = FluxImg2ImgPipeline.from_pipe(pipe)
+        print("[TGND] Img2img pipeline created from main pipe (shared weights)", flush=True)
+    except Exception as e:
+        print(f"[TGND] Could not create img2img pipeline: {e}", flush=True)
+        img2img_pipe = False  # sentinel: tried and failed
+
+
+def decode_input_image(b64_or_url):
+    """Decode a base64 string or download a URL to a PIL Image."""
+    if b64_or_url.startswith("http://") or b64_or_url.startswith("https://"):
+        import requests
+        print(f"[TGND] Downloading input image: {b64_or_url[:80]}...", flush=True)
+        resp = requests.get(b64_or_url, timeout=60)
+        resp.raise_for_status()
+        return Image.open(io.BytesIO(resp.content)).convert("RGB")
+    else:
+        # Assume base64
+        return Image.open(io.BytesIO(base64.b64decode(b64_or_url))).convert("RGB")
 
 
 def load_yolo_models():
@@ -348,27 +381,55 @@ def handler(job):
         seed = int(inp.get("seed", random.randint(1, 2147483647)))
         use_adetailer = bool(inp.get("adetailer", False))
 
-        print(f"[TGND] Generating {width}x{height}, steps={num_steps}, guidance={guidance_scale}, seed={seed}, adetailer={use_adetailer}", flush=True)
+        # img2img params
+        input_image_data = inp.get("image", "")
+        strength = float(inp.get("strength", 0.65))
+
+        is_img2img = bool(input_image_data)
+        mode = "img2img" if is_img2img else "txt2img"
+        print(f"[TGND] {mode}: {width}x{height}, steps={num_steps}, guidance={guidance_scale}, seed={seed}, strength={strength if is_img2img else 'N/A'}, adetailer={use_adetailer}", flush=True)
         t0 = time.time()
 
         generator = torch.Generator("cuda").manual_seed(seed)
 
         # Use scale from first adapter if single LoRA
         lora_scale = lora_configs[0]["scale"] if len(lora_configs) == 1 else 1.0
+        attn_kwargs = {"scale": lora_scale} if lora_configs else None
 
-        result = pipe(
-            prompt=prompt,
-            width=width,
-            height=height,
-            guidance_scale=guidance_scale,
-            num_inference_steps=num_steps,
-            generator=generator,
-            attention_kwargs={"scale": lora_scale} if lora_configs else None,
-        )
+        if is_img2img:
+            # ─── img2img mode ───
+            input_image = decode_input_image(input_image_data)
+            input_image = input_image.resize((width, height), Image.LANCZOS)
+            print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
+
+            load_img2img_pipe()
+            if img2img_pipe is False:
+                return {"status": "error", "error": "img2img pipeline not available"}
+
+            result = img2img_pipe(
+                prompt=prompt,
+                image=input_image,
+                strength=strength,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_steps,
+                generator=generator,
+                attention_kwargs=attn_kwargs,
+            )
+        else:
+            # ─── txt2img mode ───
+            result = pipe(
+                prompt=prompt,
+                width=width,
+                height=height,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_steps,
+                generator=generator,
+                attention_kwargs=attn_kwargs,
+            )
 
         image = result.images[0]
         gen_elapsed = time.time() - t0
-        print(f"[TGND] Generated in {gen_elapsed:.1f}s", flush=True)
+        print(f"[TGND] Generated in {gen_elapsed:.1f}s ({mode})", flush=True)
 
         # ADetailer post-processing
         adetailer_stats = None
@@ -387,8 +448,11 @@ def handler(job):
             "status": "ok",
             "image": b64,
             "seed": seed,
+            "mode": mode,
             "inference_time": round(elapsed, 2),
         }
+        if is_img2img:
+            response["strength"] = strength
         if adetailer_stats:
             response["adetailer"] = adetailer_stats
 
