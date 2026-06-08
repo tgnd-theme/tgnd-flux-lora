@@ -114,97 +114,63 @@ def load_inpaint_pipe():
 def prepare_img2img_latents(image, strength, num_steps, width, height, generator):
     """Prepare noisy latents from an input image for Flux 2 img2img.
     Uses flow matching: z_t = (1-t) * z_0 + t * noise.
-    Returns packed latents in shape [B, seq_len, C*4]."""
+    Returns 4D latents [B, C, H, W] — pipeline handles packing internally."""
     vae = pipe.vae
-    steps = []  # track what we did for error reporting
 
     try:
-        # Step 1: Preprocess image
+        # Preprocess image to tensor [-1, 1]
         img_tensor = torch.from_numpy(np.array(image)).float() / 255.0
         img_tensor = img_tensor * 2.0 - 1.0
         img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)
         img_tensor = img_tensor.to(device=vae.device, dtype=vae.dtype)
-        steps.append(f"preprocess: {img_tensor.shape}")
+        print(f"[TGND] img2img: input tensor {img_tensor.shape}", flush=True)
 
-        # Step 2: VAE encode
+        # VAE encode
         with torch.no_grad():
             encoded = vae.encode(img_tensor)
-        enc_type = type(encoded).__name__
-        enc_attrs = [a for a in dir(encoded) if not a.startswith('_')][:10]
-        steps.append(f"vae_encode: type={enc_type}, attrs={enc_attrs}")
 
-        # Step 3: Extract latent tensor
-        latents = None
+        # Extract latent tensor (handle different VAE output formats)
         if hasattr(encoded, 'latent_dist'):
             latents = encoded.latent_dist.sample(generator)
-            steps.append(f"latent_dist.sample: {latents.shape}")
-        if latents is None and hasattr(encoded, 'latents'):
+        elif hasattr(encoded, 'latents'):
             latents = encoded.latents
-            steps.append(f"encoded.latents: {latents.shape}")
-        if latents is None and hasattr(encoded, 'sample'):
-            s = encoded.sample
-            latents = s() if callable(s) else s
-            steps.append(f"encoded.sample: {latents.shape if hasattr(latents,'shape') else type(latents)}")
-        if latents is None and isinstance(encoded, (tuple, list)):
+        elif isinstance(encoded, (tuple, list)):
             latents = encoded[0]
-            steps.append(f"tuple[0]: {latents.shape}")
-        if latents is None:
+        else:
             latents = encoded
-            steps.append(f"raw: {type(latents).__name__}")
 
-        # Step 4: Convert to tensor
         if not isinstance(latents, torch.Tensor):
-            steps.append(f"WARN: latents is {type(latents).__name__}, not Tensor")
             if hasattr(latents, 'sample'):
-                latents = latents.sample
-                if callable(latents):
-                    latents = latents()
-                steps.append(f"after .sample: {type(latents).__name__}")
+                s = latents.sample
+                latents = s() if callable(s) else s
 
-        latents = latents.detach().clone().float()
-        steps.append(f"detached: shape={latents.shape}, dtype={latents.dtype}")
+        latents = latents.detach().clone()
+        print(f"[TGND] img2img: VAE latents {latents.shape}, dtype={latents.dtype}", flush=True)
 
-        # Step 5: Scale + shift
+        # Scale + shift (standard VAE post-processing)
         sf = getattr(vae.config, 'scaling_factor', None)
         if sf:
             latents = latents * sf
         shift_f = getattr(vae.config, 'shift_factor', None)
         if shift_f:
             latents = latents - shift_f
-        steps.append(f"scaled: sf={sf}, shift={shift_f}, shape={latents.shape}")
 
-        # Step 6: Ensure 4D
-        orig_ndim = latents.ndim
+        # Ensure 4D [B, C, H, W]
         while latents.ndim < 4:
             latents = latents.unsqueeze(0)
-        steps.append(f"4D: orig_ndim={orig_ndim}, now={latents.shape}")
+        print(f"[TGND] img2img: scaled latents {latents.shape} (sf={sf}, shift={shift_f})", flush=True)
 
-        # Step 7: Unpack dimensions
-        if latents.ndim != 4:
-            raise ValueError(f"Expected 4D tensor, got {latents.ndim}D: {latents.shape}")
-        B, C, H, W = latents.shape
-        steps.append(f"dims: B={B}, C={C}, H={H}, W={W}")
-
-        # Step 8: Pack into Flux format
-        packed = latents.reshape(B, C, H // 2, 2, W // 2, 2)
-        packed = packed.permute(0, 2, 4, 1, 3, 5)
-        packed = packed.reshape(B, (H // 2) * (W // 2), C * 4)
-        steps.append(f"packed: {packed.shape}")
-
-        # Step 9: Flow matching noise
-        noise = torch.randn(packed.shape, device=packed.device, dtype=packed.dtype, generator=generator)
-        noisy = (1.0 - strength) * packed + strength * noise
-        steps.append(f"noisy: {noisy.shape}, strength={strength}")
-
-        # Convert to pipeline's dtype
+        # Flow matching noise in 4D space (pipeline will pack later)
+        noise = torch.randn_like(latents, generator=generator)
+        noisy = (1.0 - strength) * latents + strength * noise
         noisy = noisy.to(dtype=torch.bfloat16)
 
-        print(f"[TGND] img2img latents OK: {' → '.join(steps)}", flush=True)
+        print(f"[TGND] img2img: noisy latents {noisy.shape}, strength={strength}", flush=True)
         return noisy
 
     except Exception as e:
-        print(f"[TGND] img2img latent FAIL at step {len(steps)}: {e}", flush=True)
-        print(f"[TGND] Steps completed: {steps}", flush=True)
+        print(f"[TGND] img2img latent FAIL: {e}", flush=True)
+        traceback.print_exc()
         raise
 
 
