@@ -116,49 +116,73 @@ def prepare_img2img_latents(image, strength, num_steps, width, height, generator
     Uses flow matching: z_t = (1-t) * z_0 + t * noise."""
     vae = pipe.vae
 
-    # Preprocess image to tensor [-1, 1]
-    img_tensor = torch.from_numpy(np.array(image)).float() / 255.0
-    img_tensor = img_tensor * 2.0 - 1.0
-    img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)
-    img_tensor = img_tensor.to(device=vae.device, dtype=vae.dtype)
+    # Use pipeline's image processor if available for proper preprocessing
+    if hasattr(pipe, 'image_processor'):
+        img_tensor = pipe.image_processor.preprocess(image, height=height, width=width)
+        img_tensor = img_tensor.to(device=vae.device, dtype=vae.dtype)
+    else:
+        img_tensor = torch.from_numpy(np.array(image)).float() / 255.0
+        img_tensor = img_tensor * 2.0 - 1.0
+        img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)
+        img_tensor = img_tensor.to(device=vae.device, dtype=vae.dtype)
+
+    print(f"[TGND] img2img input tensor: {img_tensor.shape}", flush=True)
 
     # Encode to latent space
     with torch.no_grad():
         encoded = vae.encode(img_tensor)
-        # Handle different VAE output types
-        if hasattr(encoded, 'latent_dist'):
-            latents = encoded.latent_dist.sample(generator)
-        elif hasattr(encoded, 'latents'):
-            latents = encoded.latents
-        elif isinstance(encoded, tuple):
-            latents = encoded[0]
-        else:
-            latents = encoded
+
+    print(f"[TGND] VAE encode output type: {type(encoded).__name__}", flush=True)
+
+    # Extract latents from various output types
+    if hasattr(encoded, 'latent_dist'):
+        latents = encoded.latent_dist.sample(generator)
+        print(f"[TGND] Used latent_dist.sample(): {latents.shape}", flush=True)
+    elif hasattr(encoded, 'latents'):
+        latents = encoded.latents
+        print(f"[TGND] Used .latents: {latents.shape}", flush=True)
+    elif hasattr(encoded, 'sample'):
+        # Some VAEs return an object with .sample attribute (not method)
+        s = encoded.sample
+        latents = s() if callable(s) else s
+        print(f"[TGND] Used .sample: {latents.shape}", flush=True)
+    elif isinstance(encoded, (tuple, list)):
+        latents = encoded[0]
+        print(f"[TGND] Used tuple[0]: {latents.shape}", flush=True)
+    else:
+        latents = encoded
+        print(f"[TGND] Used raw: {type(latents).__name__}, shape={getattr(latents, 'shape', '?')}", flush=True)
 
     # Scale
-    if hasattr(vae.config, 'scaling_factor'):
-        latents = latents * vae.config.scaling_factor
+    sf = getattr(vae.config, 'scaling_factor', None)
+    if sf:
+        latents = latents * sf
+        print(f"[TGND] Scaled by {sf}", flush=True)
 
-    print(f"[TGND] VAE latents shape: {latents.shape}, ndim: {latents.ndim}", flush=True)
+    shift = getattr(vae.config, 'shift_factor', None)
+    if shift:
+        latents = latents - shift
+        print(f"[TGND] Shifted by {shift}", flush=True)
 
-    # Ensure 4D tensor [B, C, H, W]
-    if latents.ndim == 3:
+    print(f"[TGND] Final latents: shape={latents.shape}, ndim={latents.ndim}", flush=True)
+
+    # Ensure 4D [B, C, H, W]
+    while latents.ndim < 4:
         latents = latents.unsqueeze(0)
 
-    # Pack latents into Flux format (batch, seq_len, channels)
-    # Flux uses 2x2 patches, so we need to reshape
     batch, channels, h, w = latents.shape
+    print(f"[TGND] Unpacked: batch={batch}, channels={channels}, h={h}, w={w}", flush=True)
+
+    # Pack latents into Flux format: [B, seq_len, C*4] using 2x2 patches
     latents = latents.reshape(batch, channels, h // 2, 2, w // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)  # [B, h/2, w/2, C, 2, 2]
-    latents = latents.reshape(batch, (h // 2) * (w // 2), channels * 4)  # [B, seq_len, C*4]
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    latents = latents.reshape(batch, (h // 2) * (w // 2), channels * 4)
 
-    # Flow matching: mix clean latents with noise based on strength
-    # strength=0 → original image, strength=1 → pure noise
+    # Flow matching: mix clean latents with noise
     noise = torch.randn_like(latents)
-    t = strength
-    noisy_latents = (1.0 - t) * latents + t * noise
+    noisy_latents = (1.0 - strength) * latents + strength * noise
 
-    print(f"[TGND] Prepared img2img latents: shape={noisy_latents.shape}, strength={strength}", flush=True)
+    print(f"[TGND] Packed img2img latents: {noisy_latents.shape}, strength={strength}", flush=True)
     return noisy_latents
 
 
