@@ -112,22 +112,30 @@ def load_inpaint_pipe():
 
 
 def load_img2img_pipe():
-    """Create img2img pipeline from the main pipeline (shares weights, no extra VRAM)."""
+    """Create img2img pipeline from the main pipeline (shares weights, no extra VRAM).
+    Uses inpaint pipeline with a full white mask as img2img fallback."""
     global img2img_pipe
     if img2img_pipe is not None:
         return
 
-    try:
+    # Try dedicated img2img pipeline first
+    for cls_name in ("Flux2Img2ImgPipeline", "FluxImg2ImgPipeline"):
         try:
-            from diffusers import Flux2Img2ImgPipeline
-            img2img_pipe = Flux2Img2ImgPipeline.from_pipe(pipe)
-        except ImportError:
-            from diffusers import FluxImg2ImgPipeline
-            img2img_pipe = FluxImg2ImgPipeline.from_pipe(pipe)
-        print("[TGND] Img2img pipeline created from main pipe (shared weights)", flush=True)
-    except Exception as e:
-        print(f"[TGND] Could not create img2img pipeline: {e}", flush=True)
-        img2img_pipe = False  # sentinel: tried and failed
+            cls = getattr(__import__("diffusers", fromlist=[cls_name]), cls_name)
+            img2img_pipe = cls.from_pipe(pipe)
+            print(f"[TGND] Img2img pipeline created via {cls_name} (shared weights)", flush=True)
+            return
+        except (ImportError, AttributeError, Exception) as e:
+            print(f"[TGND] {cls_name} not available: {e}", flush=True)
+
+    # Fallback: use inpaint pipeline with full white mask
+    load_inpaint_pipe()
+    if inpaint_pipe and inpaint_pipe is not False:
+        img2img_pipe = "inpaint_fallback"
+        print("[TGND] Img2img will use inpaint pipeline with full mask (fallback)", flush=True)
+    else:
+        print("[TGND] No img2img or inpaint pipeline available", flush=True)
+        img2img_pipe = False
 
 
 def decode_input_image(b64_or_url):
@@ -406,15 +414,30 @@ def handler(job):
             if img2img_pipe is False:
                 return {"status": "error", "error": "img2img pipeline not available"}
 
-            result = img2img_pipe(
-                prompt=prompt,
-                image=input_image,
-                strength=strength,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_steps,
-                generator=generator,
-                attention_kwargs=attn_kwargs,
-            )
+            if img2img_pipe == "inpaint_fallback":
+                # Use inpaint with full white mask = img2img
+                full_mask = Image.new("L", (width, height), 255)
+                print("[TGND] Using inpaint fallback (full white mask)", flush=True)
+                result = inpaint_pipe(
+                    prompt=prompt,
+                    image=input_image,
+                    mask_image=full_mask,
+                    strength=strength,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_steps,
+                    generator=generator,
+                    attention_kwargs=attn_kwargs,
+                )
+            else:
+                result = img2img_pipe(
+                    prompt=prompt,
+                    image=input_image,
+                    strength=strength,
+                    guidance_scale=guidance_scale,
+                    num_inference_steps=num_steps,
+                    generator=generator,
+                    attention_kwargs=attn_kwargs,
+                )
         else:
             # ─── txt2img mode ───
             result = pipe(
