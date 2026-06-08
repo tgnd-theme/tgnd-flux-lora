@@ -166,23 +166,33 @@ def prepare_img2img_latents(image, strength, num_steps, width, height, generator
 
     print(f"[TGND] Final latents: shape={latents.shape}, ndim={latents.ndim}", flush=True)
 
+    # Ensure it's a plain tensor
+    if hasattr(latents, 'detach'):
+        latents = latents.detach().clone()
+
     # Ensure 4D [B, C, H, W]
     while latents.ndim < 4:
         latents = latents.unsqueeze(0)
 
-    batch, channels, h, w = latents.shape
-    print(f"[TGND] Unpacked: batch={batch}, channels={channels}, h={h}, w={w}", flush=True)
+    batch_size, channels, lat_h, lat_w = latents.shape
+    print(f"[TGND] 4D latents: batch={batch_size}, ch={channels}, h={lat_h}, w={lat_w}", flush=True)
 
-    # Pack latents into Flux format: [B, seq_len, C*4] using 2x2 patches
-    latents = latents.reshape(batch, channels, h // 2, 2, w // 2, 2)
-    latents = latents.permute(0, 2, 4, 1, 3, 5)
-    latents = latents.reshape(batch, (h // 2) * (w // 2), channels * 4)
+    # Pack latents using pipeline's method if available
+    if hasattr(pipe, '_pack_latents'):
+        packed = pipe._pack_latents(latents, batch_size, channels, lat_h, lat_w)
+        print(f"[TGND] Packed via pipeline: {packed.shape}", flush=True)
+    else:
+        # Manual Flux 2x2 patch packing
+        packed = latents.reshape(batch_size, channels, lat_h // 2, 2, lat_w // 2, 2)
+        packed = packed.permute(0, 2, 4, 1, 3, 5)
+        packed = packed.reshape(batch_size, (lat_h // 2) * (lat_w // 2), channels * 4)
+        print(f"[TGND] Manual packed: {packed.shape}", flush=True)
 
     # Flow matching: mix clean latents with noise
-    noise = torch.randn_like(latents)
-    noisy_latents = (1.0 - strength) * latents + strength * noise
+    noise = torch.randn_like(packed)
+    noisy_latents = (1.0 - strength) * packed + strength * noise
 
-    print(f"[TGND] Packed img2img latents: {noisy_latents.shape}, strength={strength}", flush=True)
+    print(f"[TGND] img2img latents ready: {noisy_latents.shape}, strength={strength}", flush=True)
     return noisy_latents
 
 
