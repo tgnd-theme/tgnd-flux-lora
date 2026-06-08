@@ -98,80 +98,27 @@ def load_inpaint_pipe():
         return
 
     try:
-        # Try Flux 2 inpaint first, fall back to Flux 1
-        try:
-            from diffusers import Flux2InpaintPipeline
-            inpaint_pipe = Flux2InpaintPipeline.from_pipe(pipe)
-        except ImportError:
-            from diffusers import FluxInpaintPipeline
-            inpaint_pipe = FluxInpaintPipeline.from_pipe(pipe)
+        from diffusers import FluxInpaintPipeline
+        inpaint_pipe = FluxInpaintPipeline.from_pipe(pipe)
         print("[TGND] Inpaint pipeline created from main pipe (shared weights)", flush=True)
     except Exception as e:
         print(f"[TGND] Could not create inpaint pipeline: {e}", flush=True)
         inpaint_pipe = False  # sentinel: tried and failed
 
 
-def prepare_img2img_latents(image, strength, num_steps, width, height, generator):
-    """Prepare noisy latents from an input image for Flux 2 img2img.
-    Uses flow matching: z_t = (1-t) * z_0 + t * noise.
-    Returns 4D latents [B, C, H, W] — pipeline handles packing internally."""
-    vae = pipe.vae
+def load_img2img_pipe():
+    """Create img2img pipeline from the main pipeline (shares weights, no extra VRAM)."""
+    global img2img_pipe
+    if img2img_pipe is not None:
+        return
 
     try:
-        # Preprocess image to tensor [-1, 1]
-        img_tensor = torch.from_numpy(np.array(image)).float() / 255.0
-        img_tensor = img_tensor * 2.0 - 1.0
-        img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0)
-        img_tensor = img_tensor.to(device=vae.device, dtype=vae.dtype)
-        print(f"[TGND] img2img: input tensor {img_tensor.shape}", flush=True)
-
-        # VAE encode
-        with torch.no_grad():
-            encoded = vae.encode(img_tensor)
-
-        # Extract latent tensor (handle different VAE output formats)
-        if hasattr(encoded, 'latent_dist'):
-            latents = encoded.latent_dist.sample(generator)
-        elif hasattr(encoded, 'latents'):
-            latents = encoded.latents
-        elif isinstance(encoded, (tuple, list)):
-            latents = encoded[0]
-        else:
-            latents = encoded
-
-        if not isinstance(latents, torch.Tensor):
-            if hasattr(latents, 'sample'):
-                s = latents.sample
-                latents = s() if callable(s) else s
-
-        latents = latents.detach().clone()
-        print(f"[TGND] img2img: VAE latents {latents.shape}, dtype={latents.dtype}", flush=True)
-
-        # Scale + shift (standard VAE post-processing)
-        sf = getattr(vae.config, 'scaling_factor', None)
-        if sf:
-            latents = latents * sf
-        shift_f = getattr(vae.config, 'shift_factor', None)
-        if shift_f:
-            latents = latents - shift_f
-
-        # Ensure 4D [B, C, H, W]
-        while latents.ndim < 4:
-            latents = latents.unsqueeze(0)
-        print(f"[TGND] img2img: scaled latents {latents.shape} (sf={sf}, shift={shift_f})", flush=True)
-
-        # Flow matching noise in 4D space (pipeline will pack later)
-        noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
-        noisy = (1.0 - strength) * latents + strength * noise
-        noisy = noisy.to(dtype=torch.bfloat16)
-
-        print(f"[TGND] img2img: noisy latents {noisy.shape}, strength={strength}", flush=True)
-        return noisy
-
+        from diffusers import FluxImg2ImgPipeline
+        img2img_pipe = FluxImg2ImgPipeline.from_pipe(pipe)
+        print("[TGND] Img2img pipeline created from main pipe (shared weights)", flush=True)
     except Exception as e:
-        print(f"[TGND] img2img latent FAIL: {e}", flush=True)
-        traceback.print_exc()
-        raise
+        print(f"[TGND] Could not create img2img pipeline: {e}", flush=True)
+        img2img_pipe = False  # sentinel: tried and failed
 
 
 def decode_input_image(b64_or_url):
@@ -441,25 +388,23 @@ def handler(job):
         attn_kwargs = {"scale": lora_scale} if lora_configs else None
 
         if is_img2img:
-            # ─── img2img mode via flow matching latent injection ───
+            # ─── img2img mode via FluxImg2ImgPipeline ───
             input_image = decode_input_image(input_image_data)
             input_image = input_image.resize((width, height), Image.LANCZOS)
             print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
 
-            # Prepare noisy latents from input image
-            noisy_latents = prepare_img2img_latents(
-                input_image, strength, num_steps, width, height, generator
-            )
+            load_img2img_pipe()
+            if img2img_pipe is False:
+                return {"status": "error", "error": "img2img pipeline not available"}
 
-            # Generate from noisy latents — pipeline handles scheduler/mu internally
-            result = pipe(
+            # FluxImg2ImgPipeline handles VAE encoding, noise injection, packing
+            result = img2img_pipe(
                 prompt=prompt,
-                width=width,
-                height=height,
+                image=input_image,
+                strength=strength,
                 guidance_scale=guidance_scale,
                 num_inference_steps=num_steps,
                 generator=generator,
-                latents=noisy_latents,
                 attention_kwargs=attn_kwargs,
             )
         else:
