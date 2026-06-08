@@ -161,7 +161,7 @@ def prepare_img2img_latents(image, strength, num_steps, width, height, generator
         print(f"[TGND] img2img: scaled latents {latents.shape} (sf={sf}, shift={shift_f})", flush=True)
 
         # Flow matching noise in 4D space (pipeline will pack later)
-        noise = torch.randn_like(latents, generator=generator)
+        noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
         noisy = (1.0 - strength) * latents + strength * noise
         noisy = noisy.to(dtype=torch.bfloat16)
 
