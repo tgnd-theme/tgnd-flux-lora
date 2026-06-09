@@ -43,6 +43,7 @@ img2img_pipe = None
 loaded_lora_key = None
 yolo_face = None
 yolo_hand = None
+yolo_person = None
 
 
 def load_model():
@@ -165,6 +166,105 @@ def load_yolo_models():
         print(f"[TGND] Could not load YOLO models: {e}", flush=True)
         yolo_face = False
         yolo_hand = False
+
+
+def load_yolo_person():
+    """Load YOLO segmentation model for person detection."""
+    global yolo_person
+    if yolo_person is not None:
+        return
+
+    try:
+        from ultralytics import YOLO
+
+        yolo_dir = "/runpod-volume/yolo" if os.path.exists("/runpod-volume") else "/tmp/yolo"
+        os.makedirs(yolo_dir, exist_ok=True)
+
+        model_path = os.path.join(yolo_dir, "yolov8m-seg.pt")
+        if not os.path.exists(model_path):
+            print("[TGND] Downloading YOLOv8m-seg for person segmentation...", flush=True)
+            yolo_person = YOLO("yolov8m-seg.pt")
+            # Cache to volume for next cold start
+            import shutil
+            cached = str(yolo_person.ckpt_path) if hasattr(yolo_person, 'ckpt_path') else None
+            if cached and os.path.exists(cached):
+                shutil.copy2(cached, model_path)
+                print(f"[TGND] YOLOv8m-seg cached to {model_path}", flush=True)
+        else:
+            yolo_person = YOLO(model_path)
+
+        print("[TGND] YOLOv8m-seg loaded for person segmentation", flush=True)
+    except Exception as e:
+        print(f"[TGND] Could not load YOLOv8m-seg: {e}", flush=True)
+        yolo_person = False
+
+
+def create_person_mask(image, expand_px=15, feather=35):
+    """Detect person in image and create segmentation mask.
+    Returns a PIL Image mask (white=replace, black=keep)."""
+    load_yolo_person()
+
+    w, h = image.size
+    fallback_mask = None
+
+    if yolo_person is False:
+        print("[TGND] Person seg unavailable, using center fallback mask", flush=True)
+        # Fallback: mask center 70% of image (assumes person is centered)
+        fallback_mask = Image.new("L", (w, h), 0)
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(fallback_mask)
+        margin_x, margin_y = int(w * 0.15), int(h * 0.05)
+        draw.ellipse([margin_x, margin_y, w - margin_x, h - margin_y], fill=255)
+        return fallback_mask.filter(ImageFilter.GaussianBlur(feather))
+
+    # Detect persons (class 0 in COCO)
+    results = yolo_person(np.array(image), classes=[0], conf=0.4, verbose=False)
+
+    if not results or len(results[0].boxes) == 0:
+        print("[TGND] No person detected, using center fallback mask", flush=True)
+        fallback_mask = Image.new("L", (w, h), 0)
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(fallback_mask)
+        margin_x, margin_y = int(w * 0.15), int(h * 0.05)
+        draw.ellipse([margin_x, margin_y, w - margin_x, h - margin_y], fill=255)
+        return fallback_mask.filter(ImageFilter.GaussianBlur(feather))
+
+    # Get segmentation masks — pick the largest person
+    if results[0].masks is not None:
+        masks_data = results[0].masks.data.cpu().numpy()  # (N, H, W)
+        areas = [m.sum() for m in masks_data]
+        best_idx = int(np.argmax(areas))
+        person_mask = masks_data[best_idx]  # (H, W) float32 0-1
+
+        # Resize mask to image size (YOLO may use different resolution)
+        mask_pil = Image.fromarray((person_mask * 255).astype(np.uint8)).resize((w, h), Image.LANCZOS)
+    else:
+        # No segmentation mask available, use bounding box
+        print("[TGND] No seg mask, using bbox", flush=True)
+        boxes = results[0].boxes.xyxy.cpu().numpy()
+        areas = [(b[2] - b[0]) * (b[3] - b[1]) for b in boxes]
+        best_idx = int(np.argmax(areas))
+        bbox = boxes[best_idx]
+        mask_pil = Image.new("L", (w, h), 0)
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(mask_pil)
+        draw.rectangle([int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])], fill=255)
+
+    # Expand mask slightly to cover edges
+    if expand_px > 0:
+        mask_arr = np.array(mask_pil)
+        from scipy.ndimage import binary_dilation
+        struct = np.ones((expand_px * 2 + 1, expand_px * 2 + 1))
+        dilated = binary_dilation(mask_arr > 127, structure=struct)
+        mask_pil = Image.fromarray((dilated * 255).astype(np.uint8))
+
+    # Feather edges for smooth blend
+    mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(feather))
+
+    person_pct = np.array(mask_pil).mean() / 255 * 100
+    print(f"[TGND] Person mask created: {person_pct:.0f}% of image", flush=True)
+
+    return mask_pil
 
 
 def create_feathered_mask(image_size, bbox, feather=20):
@@ -377,9 +477,17 @@ def handler(job):
         # img2img params
         input_image_data = inp.get("image", "")
         strength = float(inp.get("strength", 0.65))
+        inpaint_person = bool(inp.get("inpaint_person", False))
 
+        # Determine mode
         is_img2img = bool(input_image_data)
-        mode = "img2img" if is_img2img else "txt2img"
+        if inpaint_person and is_img2img:
+            mode = "inpaint_person"
+        elif is_img2img:
+            mode = "img2img"
+        else:
+            mode = "txt2img"
+
         print(f"[TGND] {mode}: {width}x{height}, steps={num_steps}, guidance={guidance_scale}, seed={seed}, strength={strength if is_img2img else 'N/A'}, adetailer={use_adetailer}", flush=True)
         t0 = time.time()
 
@@ -389,7 +497,35 @@ def handler(job):
         lora_scale = lora_configs[0]["scale"] if len(lora_configs) == 1 else 1.0
         attn_kwargs = {"scale": lora_scale} if lora_configs else None
 
-        if is_img2img:
+        if mode == "inpaint_person":
+            # ─── Person inpainting mode ───
+            # Keeps background 100% original, replaces only the person via LoRA
+            input_image = decode_input_image(input_image_data)
+            input_image = input_image.resize((width, height), Image.LANCZOS)
+            print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
+
+            # Auto-detect person and create mask
+            person_mask = create_person_mask(input_image)
+
+            # Load inpaint pipeline
+            load_inpaint_pipe()
+            if inpaint_pipe is False:
+                return {"status": "error", "error": "inpaint pipeline not available"}
+
+            # Inpaint the person region with LoRA-driven generation
+            print(f"[TGND] Inpainting person region (strength={strength})", flush=True)
+            result = inpaint_pipe(
+                prompt=prompt,
+                image=input_image,
+                mask_image=person_mask,
+                strength=strength,
+                guidance_scale=guidance_scale,
+                num_inference_steps=num_steps,
+                generator=generator,
+                attention_kwargs=attn_kwargs,
+            )
+
+        elif mode == "img2img":
             # ─── img2img mode ───
             input_image = decode_input_image(input_image_data)
             input_image = input_image.resize((width, height), Image.LANCZOS)
@@ -411,7 +547,6 @@ def handler(job):
                 )
             else:
                 # Flux2Pipeline native image param — reference conditioning
-                # FLUX.2-dev is an edit model: image= provides reference context
                 print(f"[TGND] Using Flux2Pipeline native image param (reference conditioning)", flush=True)
                 result = pipe(
                     prompt=prompt,
@@ -459,7 +594,7 @@ def handler(job):
             "mode": mode,
             "inference_time": round(elapsed, 2),
         }
-        if is_img2img:
+        if mode in ("img2img", "inpaint_person"):
             response["strength"] = strength
         if adetailer_stats:
             response["adetailer"] = adetailer_stats

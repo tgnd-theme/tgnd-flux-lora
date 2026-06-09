@@ -23,7 +23,8 @@ RUN pip install --no-cache-dir \
     peft \
     'bitsandbytes>=0.43.0' \
     ultralytics \
-    opencv-python-headless
+    opencv-python-headless \
+    scipy
 
 # Verify critical imports work at build time
 RUN python3 -c "from diffusers import Flux2Pipeline, PipelineQuantizationConfig; print('All Flux 2 imports OK')"
@@ -32,8 +33,9 @@ RUN python3 -c "from diffusers import Flux2Pipeline, PipelineQuantizationConfig;
 # 1. RunPod Network Volume (/runpod-volume/flux-dev/)
 # 2. HuggingFace Hub (fallback, requires HF_TOKEN env var)
 
-# Copy handler
+# Copy handler + utilities
 COPY handler.py /app/handler.py
+COPY filmgrade.py /app/filmgrade.py
 
 # RunPod serverless entry
 CMD ["python3", "-u", "/app/handler.py"]
