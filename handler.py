@@ -491,6 +491,7 @@ def handler(job):
         num_steps = int(inp.get("num_inference_steps", 50))
         seed = int(inp.get("seed", random.randint(1, 2147483647)))
         use_adetailer = bool(inp.get("adetailer", False))
+        filmgrade_preset = inp.get("filmgrade", "")  # "ouatih" or "zishy" or "" (disabled)
 
         # img2img params
         input_image_data = inp.get("image", "")
@@ -647,6 +648,22 @@ def handler(job):
         if use_adetailer:
             image, adetailer_stats = run_adetailer(image, prompt, seed)
 
+        # ─── Film grade post-processing ───
+        if filmgrade_preset:
+            from filmgrade import PRESETS as FILM_PRESETS, grade, halation, add_grain, vignette, _rng
+            if filmgrade_preset in FILM_PRESETS:
+                print(f"[TGND] Applying filmgrade preset: {filmgrade_preset}", flush=True)
+                p = FILM_PRESETS[filmgrade_preset]
+                rng = _rng(f"tgnd_{seed}")
+                arr = np.asarray(image, dtype=float)
+                arr = grade(arr, p)
+                arr = halation(Image.fromarray(arr.astype("uint8")), p["halation"])
+                arr = add_grain(arr, p["grain_sigma"], rng)
+                arr = vignette(arr, p["vignette"])
+                image = Image.fromarray(arr.astype("uint8"))
+            else:
+                print(f"[TGND] Unknown filmgrade preset: {filmgrade_preset}, skipping", flush=True)
+
         # ─── DWPose validation: compare output pose to reference ───
         pose_validation = None
         if validate_pose and ref_pose_image is not None:
@@ -676,6 +693,8 @@ def handler(job):
             response["pose_validation"] = pose_validation
         if adetailer_stats:
             response["adetailer"] = adetailer_stats
+        if filmgrade_preset:
+            response["filmgrade"] = filmgrade_preset
 
         return response
 
