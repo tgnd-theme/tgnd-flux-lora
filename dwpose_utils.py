@@ -45,8 +45,17 @@ def load_dwpose(device="cuda"):
     import os
     print("[DWPose] Loading DWPose detector...", flush=True)
 
-    from easy_dwpose import DWposeDetector
-    _dwpose_detector = DWposeDetector(device=device)
+    from controlnet_aux import DWposeDetector
+
+    # Cache ONNX models to network volume
+    cache_dir = "/runpod-volume/dwpose" if os.path.exists("/runpod-volume") else None
+
+    _dwpose_detector = DWposeDetector.from_pretrained(
+        "yzd-v/DWPose",
+        det_filename="yolox_l.onnx",
+        pose_filename="dw-ll_ucoco_384.onnx",
+        cache_dir=cache_dir,
+    )
 
     print("[DWPose] Detector loaded", flush=True)
 
@@ -63,60 +72,70 @@ def extract_skeleton(image, device="cuda"):
         dict with:
           - keypoints: np.array shape (18, 3) — x, y, confidence per body keypoint
           - pose_image: PIL.Image — rendered skeleton visualization
-          - raw_result: full DWPose output (body + hands + face)
         Or None if no person detected.
     """
     load_dwpose(device)
 
-    # DWPose returns pose image and optionally keypoints
-    # Using the detector's __call__ which returns PIL image
-    pose_image = _dwpose_detector(
-        image,
-        output_type="pil",
-        include_hands=True,
-        include_face=False,  # face landmarks not needed for body pose
-    )
-
-    # Also get raw keypoints for analysis
-    import torch
     img_np = np.array(image)
+    h, w = img_np.shape[:2]
 
-    # easy_dwpose internal: get keypoints directly
+    # controlnet_aux DWposeDetector returns (pose_image, pose_dict)
+    # pose_dict has 'bodies', 'hands', 'faces' with keypoint data
     try:
-        result = _dwpose_detector.detect_poses(image)
-        if result is None or len(result) == 0:
-            print("[DWPose] No person detected", flush=True)
-            return None
+        pose_image, pose_data = _dwpose_detector(
+            image,
+            detect_resolution=max(h, w),
+            output_type="pil",
+            return_pose_dict=True,
+        )
+    except TypeError:
+        # Some versions don't support return_pose_dict — get image only
+        pose_image = _dwpose_detector(image, detect_resolution=max(h, w), output_type="pil")
+        pose_data = None
 
-        # Pick the largest/most confident person
-        best = result[0]
-        if hasattr(best, 'body'):
-            body_kps = np.array(best.body.keypoints)  # (18, 3) x,y,conf
-        elif isinstance(best, dict) and 'body' in best:
-            body_kps = np.array(best['body'])
-        else:
-            # Fallback: try to extract from raw result
-            body_kps = np.array(best)[:18]
+    # Extract body keypoints from pose_data
+    body_kps = None
+    if pose_data is not None:
+        try:
+            bodies = pose_data.get("bodies", {})
+            candidate = bodies.get("candidate", None)  # (N_keypoints, 2) all detected keypoints
+            subset = bodies.get("subset", None)  # (N_persons, 20) keypoint indices per person
 
-    except (AttributeError, TypeError):
-        # easy_dwpose API may vary — fallback to image-only mode
-        print("[DWPose] Could not extract raw keypoints, using image only", flush=True)
+            if candidate is not None and subset is not None and len(subset) > 0:
+                candidate = np.array(candidate)
+                subset = np.array(subset)
+
+                # Pick person with most keypoints (last 2 cols = total score + count)
+                best_person_idx = int(np.argmax(subset[:, -1]))
+                person_subset = subset[best_person_idx]
+
+                # Build 18-keypoint array with confidence
+                body_kps = np.zeros((18, 3), dtype=np.float32)
+                for i in range(18):
+                    kp_idx = int(person_subset[i])
+                    if kp_idx >= 0 and kp_idx < len(candidate):
+                        body_kps[i, 0] = candidate[kp_idx, 0]  # x (pixel)
+                        body_kps[i, 1] = candidate[kp_idx, 1]  # y (pixel)
+                        body_kps[i, 2] = 1.0  # detected = confident
+        except (KeyError, IndexError, ValueError) as e:
+            print(f"[DWPose] Could not parse pose_data: {e}", flush=True)
+
+    if body_kps is None or np.sum(body_kps[:, 2]) < 3:
+        # Fewer than 3 keypoints detected — unreliable
+        print("[DWPose] No person or insufficient keypoints detected", flush=True)
         return {
             "keypoints": None,
             "pose_image": pose_image,
-            "raw_result": None,
+            "image_size": (w, h),
         }
 
     # Normalize keypoints to 0-1 range (relative to image dimensions)
-    h, w = img_np.shape[:2]
-    if body_kps is not None and len(body_kps) >= 18:
-        norm_kps = body_kps.copy()
-        norm_kps[:, 0] /= w  # x
-        norm_kps[:, 1] /= h  # y
-    else:
-        norm_kps = None
+    norm_kps = body_kps.copy()
+    norm_kps[:, 0] /= w  # x
+    norm_kps[:, 1] /= h  # y
 
-    print(f"[DWPose] Extracted {len(body_kps) if body_kps is not None else 0} body keypoints", flush=True)
+    detected_count = int(np.sum(body_kps[:, 2] > 0))
+    print(f"[DWPose] Extracted {detected_count}/18 body keypoints", flush=True)
 
     return {
         "keypoints": norm_kps,  # normalized (18, 3)

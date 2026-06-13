@@ -28,10 +28,10 @@ RUN pip install --no-cache-dir \
     onnxruntime-gpu \
     open-clip-torch \
     ml_dtypes \
-    easy-dwpose
+    controlnet_aux
 
 # Verify critical imports work at build time
-RUN python3 -c "from diffusers import Flux2Pipeline; import insightface; import open_clip; from easy_dwpose import DWposeDetector; print('All Flux 2 + PuLID + DWPose imports OK')"
+RUN python3 -c "from diffusers import Flux2Pipeline; import insightface; import open_clip; from controlnet_aux import DWposeDetector; print('All Flux 2 + PuLID + DWPose imports OK')"
 
 # Model weights are loaded at runtime from either:
 # 1. RunPod Network Volume (/runpod-volume/flux-dev/)
