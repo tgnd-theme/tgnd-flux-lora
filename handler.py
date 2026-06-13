@@ -91,9 +91,9 @@ def load_pulid():
     os.makedirs(weights_dir, exist_ok=True)
 
     # Download weights from HuggingFace if not cached
-    weights_file = os.path.join(weights_dir, "pulid_flux2.safetensors")
+    weights_file = os.path.join(weights_dir, "pulid_flux2_klein_v2.safetensors")
     if not os.path.exists(weights_file):
-        print("[TGND] Downloading PuLID-Flux2 weights from HuggingFace...", flush=True)
+        print("[TGND] Downloading PuLID-Flux2 Klein v2 weights from HuggingFace...", flush=True)
         from huggingface_hub import hf_hub_download
         weights_file = hf_hub_download(
             "Fayens/Pulid-Flux2",

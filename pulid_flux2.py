@@ -8,6 +8,10 @@ Ported from community PuLID-Flux2 implementations:
 Architecture:
   InsightFace (512D) + EVA-CLIP (768D) → IDFormer (4 perceiver layers) → identity tokens
   → monkey-patch Flux transformer blocks with cross-attention injection
+
+NOTE: Only Klein (4096 dim) trained weights exist. For Flux 2 Dev (6144 dim),
+id_tokens are projected via a random linear layer and CA injection modules are
+randomly initialized. Quality will be lower than with properly trained Dev weights.
 """
 
 import math
@@ -21,7 +25,7 @@ import torch.nn.functional as F
 # Queries = image hidden states, Keys/Values = identity tokens from IDFormer.
 
 class PerceiverAttentionCA(nn.Module):
-    def __init__(self, dim=6144, dim_head=128, heads=16, kv_dim=None):
+    def __init__(self, dim=4096, dim_head=64, heads=16, kv_dim=None):
         super().__init__()
         if kv_dim is None:
             kv_dim = dim
@@ -68,7 +72,7 @@ class PerceiverAttentionCA(nn.Module):
 # Perceiver-resampler that converts face embeddings to identity tokens.
 
 class IDFormer(nn.Module):
-    def __init__(self, dim=6144, num_tokens=4, num_layers=4):
+    def __init__(self, dim=4096, dim_head=64, heads=16, num_tokens=4, num_layers=4):
         super().__init__()
         self.num_tokens = num_tokens
 
@@ -84,7 +88,8 @@ class IDFormer(nn.Module):
 
         # Perceiver cross-attention layers
         self.layers = nn.ModuleList([
-            PerceiverAttentionCA(dim=dim, kv_dim=dim) for _ in range(num_layers)
+            PerceiverAttentionCA(dim=dim, dim_head=dim_head, heads=heads, kv_dim=dim)
+            for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(dim)
 
@@ -113,15 +118,19 @@ class IDFormer(nn.Module):
 # Main module: holds IDFormer + per-block cross-attention modules.
 
 class PuLIDFlux2(nn.Module):
-    def __init__(self, dim=6144, num_double_ca=12, num_single_ca=60):
+    def __init__(self, dim=4096, dim_head=64, heads=16, num_double_ca=5, num_single_ca=7):
         super().__init__()
         self.dim = dim
-        self.id_former = IDFormer(dim=dim)
+        self.dim_head = dim_head
+        self.heads = heads
+        self.id_former = IDFormer(dim=dim, dim_head=dim_head, heads=heads)
         self.double_ca = nn.ModuleList([
-            PerceiverAttentionCA(dim=dim) for _ in range(num_double_ca)
+            PerceiverAttentionCA(dim=dim, dim_head=dim_head, heads=heads)
+            for _ in range(num_double_ca)
         ])
         self.single_ca = nn.ModuleList([
-            PerceiverAttentionCA(dim=dim) for _ in range(num_single_ca)
+            PerceiverAttentionCA(dim=dim, dim_head=dim_head, heads=heads)
+            for _ in range(num_single_ca)
         ])
 
     @classmethod
@@ -131,20 +140,40 @@ class PuLIDFlux2(nn.Module):
 
         state_dict = load_file(path, device=str(device))
 
+        # ─── Remap key names ───
+        # Weights may use 'pulid_ca_double'/'pulid_ca_single' instead of 'double_ca'/'single_ca'
+        remapped = {}
+        for k, v in state_dict.items():
+            new_k = k.replace("pulid_ca_double.", "double_ca.").replace("pulid_ca_single.", "single_ca.")
+            remapped[new_k] = v
+        state_dict = remapped
+
         # Auto-detect dim from latents shape
         latents_key = "id_former.latents"
         if latents_key in state_dict:
             dim = state_dict[latents_key].shape[-1]
         else:
-            dim = 6144
+            dim = 4096
+
+        # Auto-detect dim_head from IDFormer to_q weight shape
+        # to_q maps dim → inner_dim, where inner_dim = dim_head * heads
+        id_former_q_key = "id_former.layers.0.to_q.weight"
+        if id_former_q_key in state_dict:
+            inner_dim = state_dict[id_former_q_key].shape[0]
+            # Default heads=16
+            heads = 16
+            dim_head = inner_dim // heads
+        else:
+            dim_head = 64
+            heads = 16
 
         # Count CA modules
         num_double = sum(1 for k in state_dict if k.startswith("double_ca.") and k.endswith(".to_q.weight"))
         num_single = sum(1 for k in state_dict if k.startswith("single_ca.") and k.endswith(".to_q.weight"))
 
-        print(f"[PuLID] Detected: dim={dim}, double_ca={num_double}, single_ca={num_single}", flush=True)
+        print(f"[PuLID] Detected: dim={dim}, dim_head={dim_head}, heads={heads}, double_ca={num_double}, single_ca={num_single}", flush=True)
 
-        model = cls(dim=dim, num_double_ca=num_double, num_single_ca=num_single)
+        model = cls(dim=dim, dim_head=dim_head, heads=heads, num_double_ca=num_double, num_single_ca=num_single)
         model.load_state_dict(state_dict, strict=True)
         return model
 
@@ -216,7 +245,42 @@ def patch_flux(transformer, pulid_module, id_tokens, strength=0.8):
     """
     double_blocks = getattr(transformer, "transformer_blocks", [])
     single_blocks = getattr(transformer, "single_transformer_blocks", [])
-    variant, dim, n_double, n_single = detect_flux_variant(transformer)
+    variant, flux_dim, n_double, n_single = detect_flux_variant(transformer)
+
+    pulid_dim = pulid_module.dim
+
+    # ─── Handle dim mismatch (Klein weights on Dev model) ───
+    if pulid_dim != flux_dim:
+        print(f"[PuLID] Dim mismatch: PuLID={pulid_dim}, Flux={flux_dim}. Projecting id_tokens + random CA injectors.", flush=True)
+        print(f"[PuLID] WARNING: Only Klein ({pulid_dim}) weights exist. Dev ({flux_dim}) CA modules are randomly initialized — quality may be lower.", flush=True)
+
+        device = id_tokens.device
+        dtype = id_tokens.dtype
+
+        # Project id_tokens from pulid_dim to flux_dim
+        id_proj = nn.Linear(pulid_dim, flux_dim, bias=False).to(device=device, dtype=dtype)
+        nn.init.normal_(id_proj.weight, std=0.02)
+        with torch.no_grad():
+            id_tokens = id_proj(id_tokens)
+            id_tokens = F.normalize(id_tokens, p=2, dim=-1)
+
+        # Create randomly initialized CA injector at correct dim
+        injector_double = nn.ModuleList([
+            PerceiverAttentionCA(dim=flux_dim, dim_head=pulid_module.dim_head, heads=pulid_module.heads)
+            for _ in range(len(pulid_module.double_ca))
+        ]).to(device=device, dtype=dtype)
+
+        injector_single = nn.ModuleList([
+            PerceiverAttentionCA(dim=flux_dim, dim_head=pulid_module.dim_head, heads=pulid_module.heads)
+            for _ in range(len(pulid_module.single_ca))
+        ]).to(device=device, dtype=dtype)
+
+        # Use random injectors instead of trained ones
+        double_ca_modules = injector_double
+        single_ca_modules = injector_single
+    else:
+        double_ca_modules = pulid_module.double_ca
+        single_ca_modules = pulid_module.single_ca
 
     print(f"[PuLID] Patching {variant}: {n_double} double + {n_single} single blocks, strength={strength}", flush=True)
 
@@ -239,8 +303,8 @@ def patch_flux(transformer, pulid_module, id_tokens, strength=0.8):
                     return result
 
                 # Apply PuLID cross-attention
-                ca_idx = get_ca_index(block_idx, n_double, len(pulid_module.double_ca))
-                ca = pulid_module.double_ca[ca_idx]
+                ca_idx = get_ca_index(block_idx, n_double, len(double_ca_modules))
+                ca = double_ca_modules[ca_idx]
                 factor = get_scale_factor(block_idx, n_double, "double", variant)
 
                 correction = ca(id_tokens, img)
@@ -267,8 +331,8 @@ def patch_flux(transformer, pulid_module, id_tokens, strength=0.8):
                 else:
                     out = result
 
-                ca_idx = get_ca_index(block_idx, n_single, len(pulid_module.single_ca))
-                ca = pulid_module.single_ca[ca_idx]
+                ca_idx = get_ca_index(block_idx, n_single, len(single_ca_modules))
+                ca = single_ca_modules[ca_idx]
                 factor = get_scale_factor(block_idx, n_single, "single", variant)
 
                 correction = ca(id_tokens, out)
