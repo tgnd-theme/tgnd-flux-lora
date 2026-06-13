@@ -37,27 +37,29 @@ _dwpose_detector = None
 
 
 def load_dwpose(device="cuda"):
-    """Load DWPose detector (cached)."""
+    """Load DWPose detector (cached). Falls back to OpenPose if DWPose fails."""
     global _dwpose_detector
     if _dwpose_detector is not None:
         return
 
     import os
-    print("[DWPose] Loading DWPose detector...", flush=True)
+    print("[DWPose] Loading pose detector...", flush=True)
 
-    from controlnet_aux import DWposeDetector
-
-    # Cache ONNX models to network volume
-    cache_dir = "/runpod-volume/dwpose" if os.path.exists("/runpod-volume") else None
-
-    _dwpose_detector = DWposeDetector.from_pretrained(
-        "yzd-v/DWPose",
-        det_filename="yolox_l.onnx",
-        pose_filename="dw-ll_ucoco_384.onnx",
-        cache_dir=cache_dir,
-    )
-
-    print("[DWPose] Detector loaded", flush=True)
+    # Try DWPose first, fall back to OpenPose
+    try:
+        from controlnet_aux import DWposeDetector
+        # Try from_pretrained (newer controlnet_aux)
+        try:
+            _dwpose_detector = DWposeDetector.from_pretrained("yzd-v/DWPose")
+        except AttributeError:
+            # Older version — instantiate directly
+            _dwpose_detector = DWposeDetector()
+        print("[DWPose] DWPose detector loaded", flush=True)
+    except Exception as e:
+        print(f"[DWPose] DWPose failed ({e}), falling back to OpenPose", flush=True)
+        from controlnet_aux import OpenposeDetector
+        _dwpose_detector = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
+        print("[DWPose] OpenPose detector loaded (fallback)", flush=True)
 
 
 def extract_skeleton(image, device="cuda"):
@@ -79,19 +81,22 @@ def extract_skeleton(image, device="cuda"):
     img_np = np.array(image)
     h, w = img_np.shape[:2]
 
-    # controlnet_aux DWposeDetector returns (pose_image, pose_dict)
-    # pose_dict has 'bodies', 'hands', 'faces' with keypoint data
+    # controlnet_aux detectors return pose image, optionally with pose data
+    pose_data = None
     try:
-        pose_image, pose_data = _dwpose_detector(
-            image,
-            detect_resolution=max(h, w),
-            output_type="pil",
-            return_pose_dict=True,
-        )
+        # Try with return_pose_dict (some DWPose versions)
+        result = _dwpose_detector(image, detect_resolution=max(h, w), output_type="pil", return_pose_dict=True)
+        if isinstance(result, tuple) and len(result) == 2:
+            pose_image, pose_data = result
+        else:
+            pose_image = result
     except TypeError:
-        # Some versions don't support return_pose_dict — get image only
-        pose_image = _dwpose_detector(image, detect_resolution=max(h, w), output_type="pil")
-        pose_data = None
+        # Fallback: no return_pose_dict support
+        try:
+            pose_image = _dwpose_detector(image, detect_resolution=max(h, w), output_type="pil")
+        except TypeError:
+            # Minimal API — just pass the image
+            pose_image = _dwpose_detector(image)
 
     # Extract body keypoints from pose_data
     body_kps = None
