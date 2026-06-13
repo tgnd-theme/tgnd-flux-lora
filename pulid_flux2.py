@@ -420,7 +420,7 @@ def load_face_models(device="cuda"):
     clip_cache = "/runpod-volume/clip" if os.path.exists("/runpod-volume") else None
     _clip_model, _, _clip_preprocess = open_clip.create_model_and_transforms(
         "EVA02-L-14-336",
-        pretrained="merged2s_s6b_b61k",
+        pretrained="merged2b_s6b_b61k",
         cache_dir=clip_cache,
     )
     _clip_model = _clip_model.visual.to(device=device, dtype=torch.bfloat16)
