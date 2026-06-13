@@ -384,6 +384,27 @@ def load_face_models(device="cuda"):
     cache_dir = "/runpod-volume/insightface" if os.path.exists("/runpod-volume") else "/tmp/insightface"
     os.makedirs(cache_dir, exist_ok=True)
 
+    # antelopev2 models must be in {root}/models/antelopev2/
+    model_dir = os.path.join(cache_dir, "models", "antelopev2")
+    if not os.path.exists(model_dir) or len(os.listdir(model_dir)) < 4:
+        print("[PuLID] Downloading antelopev2 models from HuggingFace...", flush=True)
+        os.makedirs(model_dir, exist_ok=True)
+        from huggingface_hub import hf_hub_download
+        for model_file in [
+            "1k3d68.onnx",
+            "2d106det.onnx",
+            "genderage.onnx",
+            "glintr100.onnx",
+            "scrfd_10g_bnkps.onnx",
+        ]:
+            hf_hub_download(
+                "DIAMONIK7777/antelopev2",
+                model_file,
+                local_dir=model_dir,
+                local_dir_use_symlinks=False,
+            )
+        print(f"[PuLID] antelopev2 models downloaded to {model_dir}", flush=True)
+
     _face_app = FaceAnalysis(
         name="antelopev2",
         root=cache_dir,
