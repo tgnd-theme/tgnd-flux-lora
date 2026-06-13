@@ -21,13 +21,17 @@ RUN pip install --no-cache-dir \
     requests \
     Pillow \
     peft \
-    'bitsandbytes>=0.43.0' \
     ultralytics \
     opencv-python-headless \
-    scipy
+    scipy \
+    insightface \
+    onnxruntime-gpu \
+    open-clip-torch \
+    ml_dtypes \
+    easy-dwpose
 
 # Verify critical imports work at build time
-RUN python3 -c "from diffusers import Flux2Pipeline, PipelineQuantizationConfig; print('All Flux 2 imports OK')"
+RUN python3 -c "from diffusers import Flux2Pipeline; import insightface; import open_clip; from easy_dwpose import DWposeDetector; print('All Flux 2 + PuLID + DWPose imports OK')"
 
 # Model weights are loaded at runtime from either:
 # 1. RunPod Network Volume (/runpod-volume/flux-dev/)
@@ -35,6 +39,8 @@ RUN python3 -c "from diffusers import Flux2Pipeline, PipelineQuantizationConfig;
 
 # Copy handler + utilities
 COPY handler.py /app/handler.py
+COPY pulid_flux2.py /app/pulid_flux2.py
+COPY dwpose_utils.py /app/dwpose_utils.py
 COPY filmgrade.py /app/filmgrade.py
 
 # RunPod serverless entry

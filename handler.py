@@ -1,7 +1,8 @@
 """
-RunPod Serverless Handler — Flux 2 Dev + Multi-LoRA + ADetailer inference.
+RunPod Serverless Handler — Flux 2 Dev + Multi-LoRA + PuLID + ADetailer inference.
 
 No safety checker. No NSFW filter. Full control.
+Triple Stack: LoRA (body/style) + PuLID (face identity) + optional ADetailer (fix artifacts).
 """
 
 import os
@@ -44,52 +45,69 @@ loaded_lora_key = None
 yolo_face = None
 yolo_hand = None
 yolo_person = None
+pulid_model = None  # PuLID-Flux2 model (IDFormer + cross-attention modules)
 
 
 def load_model():
-    """Load Flux 2 Dev pipeline once (4-bit quantized via bitsandbytes).
-    Tries network volume first, then HF Hub."""
+    """Load Flux 2 Dev pipeline once in bfloat16 (no quantization — PuLID needs full weights).
+    ~55GB total VRAM on 80GB GPU with PuLID stack."""
     global pipe
     if pipe is not None:
         return
 
-    print("[TGND] Loading Flux 2 Dev pipeline...", flush=True)
+    print("[TGND] Loading Flux 2 Dev pipeline (bfloat16, no quantization)...", flush=True)
     t0 = time.time()
 
-    from diffusers import Flux2Pipeline, BitsAndBytesConfig, PipelineQuantizationConfig
+    from diffusers import Flux2Pipeline
 
     model_id = "black-forest-labs/FLUX.2-dev"
-    volume_path = "/runpod-volume/flux2-dev-nf4"
     print(f"[TGND] Using Flux2Pipeline (Flux 2 Dev), model={model_id}", flush=True)
-
-    volume_mounted = os.path.exists("/runpod-volume")
 
     hf_token = os.environ.get("HF_TOKEN", "")
     if hf_token:
         from huggingface_hub import login
         login(token=hf_token)
 
-    # Always load from HF Hub with NF4 quantization (quantized models can't be saved/loaded from volume)
-    print("[TGND] Loading Flux 2 Dev with NF4 quantization from HF Hub...", flush=True)
-
-    # Quantize transformer only (biggest component) — NF4 reduces ~60GB to ~16GB
-    quant_config = PipelineQuantizationConfig(
-        quant_backend="bitsandbytes_4bit",
-        quant_kwargs={
-            "load_in_4bit": True,
-            "bnb_4bit_quant_type": "nf4",
-            "bnb_4bit_compute_dtype": torch.bfloat16,
-        },
-        components_to_quantize=["transformer"],
-    )
+    # Load in bfloat16 without quantization — PuLID monkey-patches transformer blocks
+    # dynamically, which conflicts with quantized weights. ~38GB transformer + ~8GB text encoder.
     pipe = Flux2Pipeline.from_pretrained(
         model_id,
-        quantization_config=quant_config,
         torch_dtype=torch.bfloat16,
         device_map="balanced",
     )
 
     print(f"[TGND] Pipeline loaded in {time.time() - t0:.1f}s", flush=True)
+
+
+def load_pulid():
+    """Load PuLID-Flux2 model (IDFormer + cross-attention modules)."""
+    global pulid_model
+    if pulid_model is not None:
+        return
+
+    from pulid_flux2 import load_pulid_model, load_face_models
+
+    weights_dir = "/runpod-volume/pulid" if os.path.exists("/runpod-volume") else "/tmp/pulid"
+    os.makedirs(weights_dir, exist_ok=True)
+
+    # Download weights from HuggingFace if not cached
+    weights_file = os.path.join(weights_dir, "pulid_flux2.safetensors")
+    if not os.path.exists(weights_file):
+        print("[TGND] Downloading PuLID-Flux2 weights from HuggingFace...", flush=True)
+        from huggingface_hub import hf_hub_download
+        weights_file = hf_hub_download(
+            "Fayens/Pulid-Flux2",
+            "pulid_flux2_klein_v2.safetensors",
+            local_dir=weights_dir,
+            local_dir_use_symlinks=False,
+        )
+        print(f"[TGND] PuLID weights downloaded to {weights_file}", flush=True)
+
+    pulid_model = load_pulid_model(weights_file, device="cuda")
+
+    # Pre-load face models (InsightFace + EVA-CLIP) to avoid cold-start delay on first request
+    load_face_models(device="cuda")
+    print("[TGND] PuLID stack fully loaded", flush=True)
 
 
 def load_inpaint_pipe():
@@ -479,6 +497,14 @@ def handler(job):
         strength = float(inp.get("strength", 0.65))
         inpaint_person = bool(inp.get("inpaint_person", False))
 
+        # PuLID params
+        pulid_image_data = inp.get("pulid_image", "")
+        pulid_strength = float(inp.get("pulid_strength", 0.8))
+
+        # DWPose params
+        pose_image_data = inp.get("pose_image", "")  # reference image for pose extraction
+        validate_pose = bool(inp.get("validate_pose", False))  # compare output pose to input
+
         # Determine mode
         is_img2img = bool(input_image_data)
         if inpaint_person and is_img2img:
@@ -488,8 +514,51 @@ def handler(job):
         else:
             mode = "txt2img"
 
-        print(f"[TGND] {mode}: {width}x{height}, steps={num_steps}, guidance={guidance_scale}, seed={seed}, strength={strength if is_img2img else 'N/A'}, adetailer={use_adetailer}", flush=True)
+        print(f"[TGND] {mode}: {width}x{height}, steps={num_steps}, guidance={guidance_scale}, seed={seed}, strength={strength if is_img2img else 'N/A'}, pulid={'yes' if pulid_image_data else 'no'}, pose={'yes' if pose_image_data else 'no'}, adetailer={use_adetailer}", flush=True)
         t0 = time.time()
+
+        # ─── DWPose: extract skeleton from reference and enrich prompt ───
+        ref_pose_image = None  # keep reference for validation later
+        ref_skeleton = None
+        if pose_image_data:
+            from dwpose_utils import extract_skeleton, keypoints_to_pose_description
+
+            ref_pose_image = decode_input_image(pose_image_data)
+            ref_skeleton = extract_skeleton(ref_pose_image, device="cuda")
+
+            if ref_skeleton and ref_skeleton.get("keypoints") is not None:
+                pose_desc = keypoints_to_pose_description(ref_skeleton["keypoints"])
+                if pose_desc:
+                    # Prepend pose description to prompt for better body positioning
+                    prompt = f"{pose_desc}, {prompt}"
+                    print(f"[TGND] Pose enriched prompt: +'{pose_desc}'", flush=True)
+            else:
+                print("[TGND] DWPose: no skeleton extracted from reference", flush=True)
+
+        # ─── PuLID face identity injection ───
+        unpatch_fn = None
+        if pulid_image_data:
+            from pulid_flux2 import extract_face_embedding, patch_flux
+            load_pulid()
+
+            face_image = decode_input_image(pulid_image_data)
+            id_tokens = extract_face_embedding(face_image, device="cuda")
+
+            if id_tokens is not None:
+                # Run through IDFormer to get identity tokens
+                with torch.no_grad():
+                    id_tokens = pulid_model.id_former(id_tokens)  # [1, num_tokens, dim]
+
+                # Monkey-patch transformer blocks with identity cross-attention
+                unpatch_fn = patch_flux(
+                    pipe.transformer,
+                    pulid_model,
+                    id_tokens,
+                    strength=pulid_strength,
+                )
+                print(f"[TGND] PuLID active: strength={pulid_strength}", flush=True)
+            else:
+                print("[TGND] PuLID skipped: no face detected in reference image", flush=True)
 
         generator = torch.Generator("cuda").manual_seed(seed)
 
@@ -497,60 +566,66 @@ def handler(job):
         lora_scale = lora_configs[0]["scale"] if len(lora_configs) == 1 else 1.0
         attn_kwargs = {"scale": lora_scale} if lora_configs else None
 
-        if mode == "inpaint_person":
-            # ─── Person inpainting mode ───
-            # Keeps background 100% original, replaces only the person via LoRA
-            input_image = decode_input_image(input_image_data)
-            input_image = input_image.resize((width, height), Image.LANCZOS)
-            print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
+        try:
+            if mode == "inpaint_person":
+                # ─── Person inpainting mode ───
+                input_image = decode_input_image(input_image_data)
+                input_image = input_image.resize((width, height), Image.LANCZOS)
+                print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
 
-            # Auto-detect person and create mask
-            person_mask = create_person_mask(input_image)
+                person_mask = create_person_mask(input_image)
 
-            # Load inpaint pipeline
-            load_inpaint_pipe()
-            if inpaint_pipe is False:
-                return {"status": "error", "error": "inpaint pipeline not available"}
+                load_inpaint_pipe()
+                if inpaint_pipe is False:
+                    return {"status": "error", "error": "inpaint pipeline not available"}
 
-            # Inpaint the person region with LoRA-driven generation
-            print(f"[TGND] Inpainting person region (strength={strength})", flush=True)
-            result = inpaint_pipe(
-                prompt=prompt,
-                image=input_image,
-                mask_image=person_mask,
-                strength=strength,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_steps,
-                generator=generator,
-                attention_kwargs=attn_kwargs,
-            )
-
-        elif mode == "img2img":
-            # ─── img2img mode ───
-            input_image = decode_input_image(input_image_data)
-            input_image = input_image.resize((width, height), Image.LANCZOS)
-            print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
-
-            load_img2img_pipe()
-
-            if img2img_pipe not in (False, "native"):
-                # FluxImg2ImgPipeline — strength-based control
-                print(f"[TGND] Using FluxImg2ImgPipeline (strength={strength})", flush=True)
-                result = img2img_pipe(
+                print(f"[TGND] Inpainting person region (strength={strength})", flush=True)
+                result = inpaint_pipe(
                     prompt=prompt,
                     image=input_image,
+                    mask_image=person_mask,
                     strength=strength,
                     guidance_scale=guidance_scale,
                     num_inference_steps=num_steps,
                     generator=generator,
                     attention_kwargs=attn_kwargs,
                 )
+
+            elif mode == "img2img":
+                # ─── img2img mode ───
+                input_image = decode_input_image(input_image_data)
+                input_image = input_image.resize((width, height), Image.LANCZOS)
+                print(f"[TGND] Input image decoded and resized to {width}x{height}", flush=True)
+
+                load_img2img_pipe()
+
+                if img2img_pipe not in (False, "native"):
+                    print(f"[TGND] Using FluxImg2ImgPipeline (strength={strength})", flush=True)
+                    result = img2img_pipe(
+                        prompt=prompt,
+                        image=input_image,
+                        strength=strength,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_steps,
+                        generator=generator,
+                        attention_kwargs=attn_kwargs,
+                    )
+                else:
+                    print(f"[TGND] Using Flux2Pipeline native image param (reference conditioning)", flush=True)
+                    result = pipe(
+                        prompt=prompt,
+                        image=input_image,
+                        width=width,
+                        height=height,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_steps,
+                        generator=generator,
+                        attention_kwargs=attn_kwargs,
+                    )
             else:
-                # Flux2Pipeline native image param — reference conditioning
-                print(f"[TGND] Using Flux2Pipeline native image param (reference conditioning)", flush=True)
+                # ─── txt2img mode ───
                 result = pipe(
                     prompt=prompt,
-                    image=input_image,
                     width=width,
                     height=height,
                     guidance_scale=guidance_scale,
@@ -558,26 +633,25 @@ def handler(job):
                     generator=generator,
                     attention_kwargs=attn_kwargs,
                 )
-        else:
-            # ─── txt2img mode ───
-            result = pipe(
-                prompt=prompt,
-                width=width,
-                height=height,
-                guidance_scale=guidance_scale,
-                num_inference_steps=num_steps,
-                generator=generator,
-                attention_kwargs=attn_kwargs,
-            )
 
-        image = result.images[0]
-        gen_elapsed = time.time() - t0
-        print(f"[TGND] Generated in {gen_elapsed:.1f}s ({mode})", flush=True)
+            image = result.images[0]
+            gen_elapsed = time.time() - t0
+            print(f"[TGND] Generated in {gen_elapsed:.1f}s ({mode})", flush=True)
+        finally:
+            # ALWAYS unpatch transformer blocks to prevent stacking across requests
+            if unpatch_fn is not None:
+                unpatch_fn()
 
         # ADetailer post-processing
         adetailer_stats = None
         if use_adetailer:
             image, adetailer_stats = run_adetailer(image, prompt, seed)
+
+        # ─── DWPose validation: compare output pose to reference ───
+        pose_validation = None
+        if validate_pose and ref_pose_image is not None:
+            from dwpose_utils import validate_pose as run_pose_validation
+            pose_validation = run_pose_validation(ref_pose_image, image, device="cuda")
 
         # Encode to JPEG base64
         buf = io.BytesIO()
@@ -596,6 +670,10 @@ def handler(job):
         }
         if mode in ("img2img", "inpaint_person"):
             response["strength"] = strength
+        if pulid_image_data:
+            response["pulid"] = {"active": unpatch_fn is not None, "strength": pulid_strength}
+        if pose_validation:
+            response["pose_validation"] = pose_validation
         if adetailer_stats:
             response["adetailer"] = adetailer_stats
 
