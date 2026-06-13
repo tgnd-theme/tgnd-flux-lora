@@ -680,8 +680,9 @@ def handler(job):
         return response
 
     except Exception as e:
-        print(f"[TGND] ERROR in handler: {traceback.format_exc()}", flush=True)
-        return {"status": "error", "error": str(e)}
+        tb = traceback.format_exc()
+        print(f"[TGND] ERROR in handler: {tb}", flush=True)
+        return {"status": "error", "error": str(e) or type(e).__name__, "traceback": tb[-2000:]}
 
 
 # ─── RunPod entry point ───
