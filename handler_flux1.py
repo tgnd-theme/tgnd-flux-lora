@@ -72,13 +72,13 @@ def load_model():
 
     # Load Flux 1 Dev with ControlNet — NO NF4 to avoid LoRA+ControlNet bugs
     # bfloat16: ~24GB transformer + ~10GB T5-XXL + ~1GB CLIP + ~1GB VAE + ~4GB ControlNet = ~40GB
+    # Use .to("cuda") instead of device_map="balanced" to keep all components on same device
     print("[TGND-F1] Loading FLUX.1-dev pipeline (bfloat16, no quantization)...", flush=True)
     pipe = FluxControlNetImg2ImgPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         controlnet=controlnet,
         torch_dtype=torch.bfloat16,
-        device_map="balanced",
-    )
+    ).to("cuda")
 
     elapsed = time.time() - t0
     print(f"[TGND-F1] Pipeline loaded in {elapsed:.1f}s", flush=True)
