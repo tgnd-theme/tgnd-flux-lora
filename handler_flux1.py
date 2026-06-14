@@ -293,26 +293,28 @@ def download_lora(url_or_path):
 
 
 def load_loras(lora_configs):
-    """Load one or more LoRAs. Caches the combination."""
+    """Load LoRAs by fusing into model weights. Avoids float32/bfloat16 dtype conflicts."""
     global loaded_lora_key
 
     if not lora_configs:
         if loaded_lora_key:
             try:
+                pipe.unfuse_lora()
                 pipe.unload_lora_weights()
             except Exception:
                 pass
             loaded_lora_key = None
         return None
 
-    # Create a cache key from URLs
-    cache_key = "|".join(sorted(c["url"] for c in lora_configs))
+    # Create a cache key from URLs + scales (scale matters for fused weights)
+    cache_key = "|".join(f"{c['url']}@{c['scale']}" for c in sorted(lora_configs, key=lambda x: x["url"]))
     if loaded_lora_key == cache_key:
-        print(f"[TGND-F1] LoRAs already loaded ({len(lora_configs)} adapters)", flush=True)
-        return {f"lora_{i}": c["scale"] for i, c in enumerate(lora_configs)}
+        print(f"[TGND-F1] LoRAs already fused ({len(lora_configs)} adapters)", flush=True)
+        return True
 
-    # Unload previous
+    # Unfuse + unload previous
     try:
+        pipe.unfuse_lora()
         pipe.unload_lora_weights()
     except Exception:
         pass
@@ -325,22 +327,20 @@ def load_loras(lora_configs):
         name = f"lora_{i}"
         path = download_lora(cfg["url"])
         pipe.load_lora_weights(path, adapter_name=name)
-        # Cast LoRA weights to bfloat16 to match pipeline dtype (fal.ai exports float32)
-        for param in pipe.transformer.parameters():
-            if param.requires_grad and param.dtype == torch.float32:
-                param.data = param.data.to(torch.bfloat16)
         adapter_names.append(name)
         adapter_weights.append(cfg["scale"])
         print(f"[TGND-F1] Loaded adapter '{name}' (scale={cfg['scale']})", flush=True)
 
-    # Set active adapters with weights
-    if len(adapter_names) > 1:
-        pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+    # Set adapters with weights, then fuse into model weights
+    pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+    pipe.fuse_lora(adapter_names=adapter_names)
+    pipe.unload_lora_weights()
+    print(f"[TGND-F1] LoRAs fused into model weights (no separate float32 tensors)", flush=True)
 
     loaded_lora_key = cache_key
-    print(f"[TGND-F1] {len(lora_configs)} LoRAs loaded in {time.time() - t0:.1f}s", flush=True)
+    print(f"[TGND-F1] {len(lora_configs)} LoRAs loaded+fused in {time.time() - t0:.1f}s", flush=True)
 
-    return {name: weight for name, weight in zip(adapter_names, adapter_weights)}
+    return True
 
 
 def apply_filmgrade(image, preset, seed):
@@ -417,9 +417,8 @@ def handler(job):
         input_image = input_image.resize((width, height), Image.LANCZOS)
         print(f"[TGND-F1] Input image decoded and resized to {width}x{height}", flush=True)
 
-        # LoRA scale — use joint_attention_kwargs for Flux 1
-        lora_scale = lora_configs[0]["scale"] if len(lora_configs) == 1 else 1.0
-        joint_attn_kwargs = {"scale": lora_scale} if lora_configs else None
+        # LoRA scale is already baked in via fuse_lora — no joint_attention_kwargs needed
+        joint_attn_kwargs = None
 
         if has_pose:
             # ─── img2img + ControlNet mode ───
