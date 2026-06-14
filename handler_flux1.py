@@ -325,6 +325,10 @@ def load_loras(lora_configs):
         name = f"lora_{i}"
         path = download_lora(cfg["url"])
         pipe.load_lora_weights(path, adapter_name=name)
+        # Cast LoRA weights to bfloat16 to match pipeline dtype (fal.ai exports float32)
+        for param in pipe.transformer.parameters():
+            if param.requires_grad and param.dtype == torch.float32:
+                param.data = param.data.to(torch.bfloat16)
         adapter_names.append(name)
         adapter_weights.append(cfg["scale"])
         print(f"[TGND-F1] Loaded adapter '{name}' (scale={cfg['scale']})", flush=True)
