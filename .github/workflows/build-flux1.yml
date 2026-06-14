@@ -1,0 +1,51 @@
+name: Build & Push Flux 1 Docker Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'handler_flux1.py'
+      - 'Dockerfile.flux1'
+      - 'filmgrade.py'
+  workflow_dispatch:
+
+env:
+  DOCKERHUB_IMAGE: tgndtheme/tgnd-flux-lora
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_IMAGE }}
+          tags: |
+            type=sha,format=long,prefix=flux1-
+            type=raw,value=flux1-latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.flux1
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.description=TGND Flux 1 Dev + ControlNet inference handler for RunPod
+          provenance: false
