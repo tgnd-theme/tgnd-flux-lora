@@ -68,19 +68,23 @@ def load_model():
     controlnet = FluxControlNetModel.from_pretrained(
         "Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0",
         torch_dtype=torch.bfloat16,
-    )
+    ).to("cuda")
 
     # Load Flux 1 Dev with ControlNet — NO NF4 to avoid LoRA+ControlNet bugs
     # bfloat16: ~24GB transformer + ~10GB T5-XXL + ~1GB CLIP + ~1GB VAE + ~4GB ControlNet = ~40GB
-    # Use enable_model_cpu_offload() — moves components to GPU on-demand, avoids device mismatches
-    # Don't use .to("cuda") or device_map="balanced" — causes cpu/cuda tensor splits
+    # Load pipeline and explicitly move all components to CUDA
     print("[TGND-F1] Loading FLUX.1-dev pipeline (bfloat16, no quantization)...", flush=True)
     pipe = FluxControlNetImg2ImgPipeline.from_pretrained(
         "black-forest-labs/FLUX.1-dev",
         controlnet=controlnet,
         torch_dtype=torch.bfloat16,
     )
-    pipe.enable_model_cpu_offload()
+    # Move each component to CUDA explicitly — avoids device_map splits
+    pipe.transformer.to("cuda")
+    pipe.text_encoder.to("cuda")
+    pipe.text_encoder_2.to("cuda")
+    pipe.vae.to("cuda")
+    print("[TGND-F1] All pipeline components moved to CUDA", flush=True)
 
     elapsed = time.time() - t0
     print(f"[TGND-F1] Pipeline loaded in {elapsed:.1f}s", flush=True)
