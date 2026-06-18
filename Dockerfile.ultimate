@@ -7,9 +7,9 @@ RUN pip install --no-cache-dir \
     torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Install Python dependencies
-# NO bitsandbytes — Flux 1 bfloat16 fits on A100 80GB without quantization
-# NO insightface/open-clip — no PuLID
-# controlnet_aux for DWPose extraction
+# Flux 1 bfloat16 fits on A100 80GB without quantization (no bitsandbytes)
+# mediapipe for hand detection (pass 2)
+# gfpgan for face restoration (pass 3d)
 RUN pip install --no-cache-dir \
     runpod \
     'diffusers>=0.38.0' \
@@ -25,17 +25,23 @@ RUN pip install --no-cache-dir \
     ultralytics \
     opencv-python-headless \
     scipy \
-    controlnet_aux
+    controlnet_aux \
+    mediapipe \
+    gfpgan \
+    basicsr \
+    facexlib
 
 # Verify critical imports work at build time
 RUN python3 -c "\
-from diffusers import FluxControlNetImg2ImgPipeline, FluxControlNetModel; \
+from diffusers import FluxControlNetImg2ImgPipeline, FluxControlNetModel, FluxMultiControlNetModel; \
 from diffusers import FluxControlNetInpaintPipeline; \
 from controlnet_aux import DWposeDetector; \
-print('Flux 1 + ControlNet + Inpaint + DWPose imports OK')"
+import mediapipe; \
+from gfpgan import GFPGANer; \
+print('Flux 1 + ControlNet + Inpaint + DWPose + MediaPipe + GFPGAN imports OK')"
 
 # Copy handler + utilities
-COPY handler_flux1.py /app/handler.py
+COPY handler_ultimate.py /app/handler.py
 COPY filmgrade.py /app/filmgrade.py
 
 # RunPod serverless entry
