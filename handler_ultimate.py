@@ -869,17 +869,35 @@ def handler(job):
             # (We keep the transformer/encoders shared via from_pretrained cache)
             inpaint_pipe_obj = create_inpaint_pipe()
 
-            # Reload LoRAs into inpaint pipe
+            # Reload LoRAs into inpaint pipe (some may fail due to architecture mismatch)
+            inpaint_adapter_names = []
+            inpaint_adapter_weights = []
             for i, config in enumerate(lora_configs):
                 url = config.get("url", "")
-                if url:
+                if not url:
+                    continue
+                try:
                     local_path = download_lora(url)
                     inpaint_pipe_obj.load_lora_weights(local_path, adapter_name=f"adapter_{i}")
+                    # Verify adapter was actually loaded
+                    present = set()
+                    for comp in [inpaint_pipe_obj.transformer, inpaint_pipe_obj.text_encoder, inpaint_pipe_obj.text_encoder_2]:
+                        if hasattr(comp, 'peft_config'):
+                            present.update(comp.peft_config.keys())
+                    if f"adapter_{i}" in present:
+                        inpaint_adapter_names.append(f"adapter_{i}")
+                        inpaint_adapter_weights.append(float(config.get("scale", 1.0)))
+                        log(f"  Inpaint LoRA adapter_{i} loaded OK")
+                    else:
+                        log(f"  Inpaint LoRA adapter_{i} loaded but not present (incompatible keys?), skipping")
+                except Exception as e:
+                    log(f"  Inpaint LoRA adapter_{i} failed (skipping): {e}")
 
-            adapter_names = [f"adapter_{i}" for i in range(len(lora_configs)) if lora_configs[i].get("url")]
-            adapter_weights = [float(c.get("scale", 1.0)) for c in lora_configs if c.get("url")]
-            if adapter_names:
-                inpaint_pipe_obj.set_adapters(adapter_names, adapter_weights=adapter_weights)
+            if inpaint_adapter_names:
+                inpaint_pipe_obj.set_adapters(inpaint_adapter_names, adapter_weights=inpaint_adapter_weights)
+                log(f"  Inpaint adapters set: {inpaint_adapter_names}")
+            else:
+                log("  WARNING: No LoRAs loaded into inpaint pipe")
 
             load_fix_models()
 
