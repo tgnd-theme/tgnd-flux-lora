@@ -25,20 +25,21 @@ RUN pip install --no-cache-dir \
     ultralytics \
     opencv-python-headless \
     scipy \
+    'mediapipe<0.10.15' \
     controlnet_aux \
-    mediapipe \
     gfpgan \
     basicsr \
     facexlib
 
 # Verify critical imports work at build time
+# Note: controlnet_aux DWposeDetector import skipped — triggers mediapipe.solutions
+# which has compatibility issues. DWPose is loaded lazily at runtime.
 RUN python3 -c "\
 from diffusers import FluxControlNetImg2ImgPipeline, FluxControlNetModel, FluxMultiControlNetModel; \
 from diffusers import FluxControlNetInpaintPipeline; \
-from controlnet_aux import DWposeDetector; \
 import mediapipe; \
 from gfpgan import GFPGANer; \
-print('Flux 1 + ControlNet + Inpaint + DWPose + MediaPipe + GFPGAN imports OK')"
+print('Flux 1 + ControlNet + Inpaint + MediaPipe + GFPGAN imports OK')"
 
 # Copy handler + utilities
 COPY handler_ultimate.py /app/handler.py
