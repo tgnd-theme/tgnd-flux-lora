@@ -179,21 +179,27 @@ def load_base_models():
 
 
 def load_segformer():
-    """Load SegFormer B5 for body segmentation."""
+    """Load SegFormer B2 clothes/body-parts model (~400MB VRAM).
+
+    mattmdjaga/segformer_b2_clothes — 18 classes:
+      0:Background 1:Hat 2:Hair 3:Sunglasses 4:Upper-clothes 5:Skirt
+      6:Pants 7:Dress 8:Belt 9:Left-shoe 10:Right-shoe 11:Face
+      12:Left-leg 13:Right-leg 14:Left-arm 15:Right-arm 16:Bag 17:Scarf
+    """
     global segformer_model, segformer_processor
     if segformer_model is not None:
         return
 
-    from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
+    from transformers import SegformerImageProcessor, AutoModelForSemanticSegmentation
     segformer_processor = SegformerImageProcessor.from_pretrained(
-        "nvidia/segformer-b5-finetuned-ade-640-640",
+        "mattmdjaga/segformer_b2_clothes",
         cache_dir=MODEL_CACHE,
     )
-    segformer_model = SegformerForSemanticSegmentation.from_pretrained(
-        "nvidia/segformer-b5-finetuned-ade-640-640",
+    segformer_model = AutoModelForSemanticSegmentation.from_pretrained(
+        "mattmdjaga/segformer_b2_clothes",
         cache_dir=MODEL_CACHE,
-    ).to("cuda")
-    log("SegFormer B5 loaded")
+    ).to("cuda").eval()
+    log("SegFormer B2 (clothes/body-parts) loaded")
 
 
 def load_depth_model():
@@ -455,12 +461,10 @@ def get_part_mask(seg_map, class_ids, dilate_px=8):
     return mask
 
 
-def get_skin_mask(image):
-    """Get skin mask using SegFormer for filmgrade skin texture."""
-    seg_map = segment_body(image)
-    # ADE20K person class = 12
-    skin_mask = get_part_mask(seg_map, [12], dilate_px=0)
-    return skin_mask
+# SegFormer B2 class ID mappings (mattmdjaga/segformer_b2_clothes)
+# Person (all body) = union of skin + clothing classes
+SEG_PERSON_IDS = [4, 5, 6, 7, 8, 11, 12, 13, 14, 15]  # clothes + skin
+SEG_SKIN_IDS = [11, 12, 13, 14, 15]  # Face, Left-leg, Right-leg, Left-arm, Right-arm
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +648,8 @@ def pass3_fix_body(inpaint_pipe, image, body_prompt, clothing_desc, seed):
 
     seg_map = segment_body(image)
 
-    # ADE20K: person=12
-    body_mask = get_part_mask(seg_map, [12], dilate_px=4)
+    # Body = all person classes (skin + clothing)
+    body_mask = get_part_mask(seg_map, SEG_PERSON_IDS, dilate_px=4)
 
     # Only fix if body is detected
     body_pixels = np.sum(body_mask > 0)
@@ -694,7 +698,7 @@ def pass3e_fix_chest(inpaint_pipe, image, body_prompt, seed, clothing_desc=""):
     import cv2
 
     seg_map = segment_body(image)
-    body_mask = get_part_mask(seg_map, [12], dilate_px=0)
+    body_mask = get_part_mask(seg_map, SEG_PERSON_IDS, dilate_px=0)
 
     h, w = body_mask.shape
     # Chest region: roughly upper-middle body area
@@ -770,15 +774,15 @@ def pass3d_restore_face(image, weight=0.7):
 # ---------------------------------------------------------------------------
 
 def get_skin_mask(image):
-    """Get skin-only mask using SegFormer. Returns (H, W) float 0-1 or None.
+    """Get skin-only mask using SegFormer B2. Returns (H, W) float 0-1 or None.
 
+    Uses mattmdjaga/segformer_b2_clothes classes:
     Skin = Face (11) + Left-leg (12) + Right-leg (13) + Left-arm (14) + Right-arm (15)
     """
     try:
         import cv2
         seg_map = segment_body(image)
-        skin_ids = [11, 12, 13, 14, 15]
-        skin_binary = np.isin(seg_map, skin_ids).astype(np.float32)
+        skin_binary = np.isin(seg_map, SEG_SKIN_IDS).astype(np.float32)
 
         if skin_binary.max() < 0.01:
             return None
@@ -1108,7 +1112,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.1-skin-texture",
+            "handler_version": "v2.2-segformer-b2-clothes",
         }
 
     except Exception as e:
