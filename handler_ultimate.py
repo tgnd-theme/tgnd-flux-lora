@@ -728,19 +728,120 @@ def pass3d_restore_face(image, weight=0.7):
 # Pass 5: Filmgrade + Anti-AI + Skin Texture
 # ---------------------------------------------------------------------------
 
+def get_skin_mask(image):
+    """Get skin-only mask using SegFormer. Returns (H, W) float 0-1 or None.
+
+    Skin = Face (11) + Left-leg (12) + Right-leg (13) + Left-arm (14) + Right-arm (15)
+    """
+    try:
+        import cv2
+        seg_map = segment_body(image)
+        skin_ids = [11, 12, 13, 14, 15]
+        skin_binary = np.isin(seg_map, skin_ids).astype(np.float32)
+
+        if skin_binary.max() < 0.01:
+            return None
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (6, 6))
+        skin_binary = cv2.erode(skin_binary, kernel, iterations=1)
+
+        skin_pil = Image.fromarray((skin_binary * 255).astype("uint8"))
+        skin_pil = skin_pil.filter(ImageFilter.GaussianBlur(radius=5))
+        skin_mask = np.asarray(skin_pil, dtype=np.float32) / 255.0
+        skin_pct = skin_mask.mean() * 100
+        log(f"  [P5] Skin mask: {skin_pct:.1f}% coverage")
+        return skin_mask
+    except Exception as e:
+        log(f"  [P5] Skin mask extraction failed: {e}")
+        return None
+
+
+def fg_skin_texture(arr, skin_mask, rng):
+    """4-layer skin realism pipeline (v12b golden standard). Applies ONLY to skin.
+
+    Layers:
+      1. Sub-surface scattering (SSS) — warm color bleeding
+      2. Frequency separation retexture — fills missing pore/wrinkle bands
+      3. Specular highlight breaking — roughens AI-perfect highlights
+      4. Blood perfusion — micro color variation
+    """
+    import cv2
+
+    if skin_mask is None or skin_mask.max() < 0.01:
+        return arr
+
+    h, w = arr.shape[:2]
+    img = arr.copy()
+    sm = skin_mask
+
+    # --- Layer 1: SSS simulation ---
+    sss_r = cv2.GaussianBlur(img[..., 0].astype(np.float32), (0, 0), sigmaX=8)
+    sss_g = cv2.GaussianBlur(img[..., 1].astype(np.float32), (0, 0), sigmaX=5)
+    sss_b = cv2.GaussianBlur(img[..., 2].astype(np.float32), (0, 0), sigmaX=3)
+    sss = np.stack([sss_r, sss_g, sss_b], axis=-1)
+    lum = (img @ np.array([0.299, 0.587, 0.114])).astype(np.float32) / 255.0
+    sss_weight = np.exp(-((lum - 0.5) ** 2) / (2 * 0.15 ** 2))
+    blend = (0.15 * sss_weight * sm)[..., None]
+    img = img * (1 - blend) + sss * blend
+    shadow_area = ((lum < 0.35) * sm).astype(np.float32)
+    shadow_area = cv2.GaussianBlur(shadow_area, (0, 0), sigmaX=5)
+    img[..., 0] += 1.5 * shadow_area
+    img[..., 2] -= 0.8 * shadow_area
+
+    # --- Layer 2: Frequency separation retexture ---
+    gray = (img @ np.array([0.299, 0.587, 0.114])).astype(np.float32)
+    low_3 = cv2.GaussianBlur(gray, (0, 0), sigmaX=3)
+    existing_hf = gray - low_3
+    skin_px = existing_hf[sm > 0.5]
+    existing_energy = float(np.std(skin_px)) if len(skin_px) > 100 else 0
+    deficit = max(0, 5.0 - existing_energy)
+    if deficit > 0.5:
+        pore_raw = rng.normal(0, 1, (h, w)).astype(np.float32)
+        pore_bp = cv2.GaussianBlur(pore_raw, (0, 0), sigmaX=1.2)
+        pore_bp = pore_bp - cv2.GaussianBlur(pore_bp, (0, 0), sigmaX=3.0)
+        mid_raw = rng.normal(0, 1, (h, w)).astype(np.float32)
+        mid_bp = cv2.GaussianBlur(mid_raw, (0, 0), sigmaX=3.0)
+        mid_bp = mid_bp - cv2.GaussianBlur(mid_bp, (0, 0), sigmaX=8.0)
+        synth = pore_bp * 0.6 + mid_bp * 0.4
+        synth_std = float(np.std(synth))
+        if synth_std > 0:
+            synth = synth * (deficit / synth_std) * 0.35
+        tex_rgb = np.stack([synth * 1.05, synth * 0.95, synth * 0.88], axis=-1)
+        midtone = np.clip(1.0 - np.abs(lum - 0.47) / 0.4, 0.3, 1.0)
+        img = img + tex_rgb * (sm * midtone)[..., None]
+
+    # --- Layer 3: Specular highlight breaking ---
+    brightness = gray / 255.0
+    hl_mask = ((brightness > 0.75) * sm).astype(np.float32)
+    hl_mask = cv2.GaussianBlur(hl_mask, (0, 0), sigmaX=3)
+    if hl_mask.max() > 0.01:
+        disrupt = rng.normal(0, 1, (h, w)).astype(np.float32)
+        disrupt = cv2.GaussianBlur(disrupt, (0, 0), sigmaX=1.0)
+        disrupt = disrupt - cv2.GaussianBlur(disrupt, (0, 0), sigmaX=3.5)
+        intensity = np.clip((brightness - 0.75) / 0.25, 0, 1)
+        img = img - disrupt * 8.0 * hl_mask * intensity
+
+    # --- Layer 4: Blood perfusion ---
+    perf_grid = rng.normal(0, 1, ((h + 49) // 50, (w + 49) // 50)).astype(np.float32)
+    perfusion = cv2.resize(perf_grid, (w, h), interpolation=cv2.INTER_CUBIC)
+    perf2_grid = rng.normal(0, 1, ((h + 19) // 20, (w + 19) // 20)).astype(np.float32)
+    perfusion2 = cv2.resize(perf2_grid, (w, h), interpolation=cv2.INTER_CUBIC)
+    color_shift = (perfusion * 0.6 + perfusion2 * 0.4) * 1.5
+    img[..., 0] += color_shift * sm * 1.1
+    img[..., 1] -= color_shift * sm * 0.3
+
+    return np.clip(img, 0, 255)
+
+
 def pass5_filmgrade(image, seed):
-    """Apply filmgrade (warm Kodak 35mm grade) + anti-AI processing."""
+    """Apply filmgrade + skin texture + anti-AI processing (v12b golden standard)."""
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import filmgrade as fg
 
-        # Use ouatih preset (Once Upon a Time in Hollywood — warm golden Kodak 35mm)
         p = fg.PRESETS["ouatih"]
+        p = dict(p, grain_sigma=3.5)  # v12b golden standard
 
-        # Override grain_sigma to 3.5 (v12b golden standard — lower than default 6.0)
-        p = dict(p, grain_sigma=3.5)
-
-        # Create deterministic RNG from seed
         rng = np.random.RandomState(seed % (2**31))
         arr = np.asarray(image, dtype=float)
 
@@ -750,15 +851,21 @@ def pass5_filmgrade(image, seed):
         arr = fg.add_grain(arr, p["grain_sigma"], rng)
         arr = fg.vignette(arr, p["vignette"])
 
-        # Step 2: Anti-AI processing (break perfect AI smoothness)
+        # Step 2: 4-layer skin texture (SSS + pores + specular + perfusion)
+        skin_mask = get_skin_mask(image)
+        if skin_mask is not None:
+            arr = fg_skin_texture(arr, skin_mask, rng)
+            log(f"  [P5] Skin texture applied (4 layers)")
+        else:
+            log(f"  [P5] No skin detected, skipping texture")
+
+        # Step 3: Anti-AI processing
         arr = fg.deai(arr, rng, fg.DEAI)
 
         out = Image.fromarray(arr.astype("uint8"))
-
-        # Step 3: JPEG compression (real photos always have JPEG artifacts)
         out = fg.jpeg_compress(out, fg.DEAI["jpeg_quality"])
 
-        log(f"  [P5] Filmgrade + anti-AI applied (grain_sigma=3.5)")
+        log(f"  [P5] Filmgrade + skin texture + anti-AI applied (grain_sigma=3.5)")
         return out
     except Exception as e:
         log(f"  [P5] Filmgrade failed: {e}")
