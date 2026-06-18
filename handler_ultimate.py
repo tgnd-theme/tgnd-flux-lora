@@ -773,18 +773,28 @@ def pass3d_restore_face(image, weight=0.7):
 # Pass 5: Filmgrade + Anti-AI + Skin Texture
 # ---------------------------------------------------------------------------
 
+_skin_mask_error = None  # Global to report errors in output
+
 def get_skin_mask(image):
     """Get skin-only mask using SegFormer B2. Returns (H, W) float 0-1 or None.
 
     Uses mattmdjaga/segformer_b2_clothes classes:
     Skin = Face (11) + Left-leg (12) + Right-leg (13) + Left-arm (14) + Right-arm (15)
     """
+    global _skin_mask_error
     try:
         import cv2
+        log(f"  [P5] Running SegFormer skin detection (model loaded: {segformer_model is not None})")
         seg_map = segment_body(image)
+        unique_classes = np.unique(seg_map).tolist()
+        log(f"  [P5] SegFormer classes found: {unique_classes}")
         skin_binary = np.isin(seg_map, SEG_SKIN_IDS).astype(np.float32)
+        skin_pct_raw = skin_binary.mean() * 100
+        log(f"  [P5] Raw skin coverage: {skin_pct_raw:.1f}%")
 
         if skin_binary.max() < 0.01:
+            log(f"  [P5] No skin pixels detected, skipping texture")
+            _skin_mask_error = f"no_skin_pixels (classes={unique_classes})"
             return None
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (6, 6))
@@ -794,10 +804,18 @@ def get_skin_mask(image):
         skin_pil = skin_pil.filter(ImageFilter.GaussianBlur(radius=5))
         skin_mask = np.asarray(skin_pil, dtype=np.float32) / 255.0
         skin_pct = skin_mask.mean() * 100
-        log(f"  [P5] Skin mask: {skin_pct:.1f}% coverage")
+        log(f"  [P5] Skin mask: {skin_pct:.1f}% coverage (after erosion+blur)")
+
+        if skin_mask.max() < 0.01:
+            _skin_mask_error = f"skin_eroded_away (raw={skin_pct_raw:.1f}%)"
+            return None
+
         return skin_mask
     except Exception as e:
+        import traceback
+        _skin_mask_error = f"{type(e).__name__}: {e}"
         log(f"  [P5] Skin mask extraction failed: {e}")
+        log(traceback.format_exc())
         return None
 
 
@@ -1112,7 +1130,8 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.2-segformer-b2-clothes",
+            "handler_version": "v2.3-debug-skin",
+            "skin_debug": _skin_mask_error,
         }
 
     except Exception as e:
