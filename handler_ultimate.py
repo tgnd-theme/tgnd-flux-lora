@@ -875,7 +875,9 @@ def fg_skin_texture(arr, skin_mask, rng):
 
 
 def pass5_filmgrade(image, seed):
-    """Apply filmgrade + skin texture + anti-AI processing (v12b golden standard)."""
+    """Apply filmgrade + skin texture + anti-AI processing (v12b golden standard).
+    Returns (image, skin_texture_applied)."""
+    skin_applied = False
     try:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         import filmgrade as fg
@@ -896,6 +898,7 @@ def pass5_filmgrade(image, seed):
         skin_mask = get_skin_mask(image)
         if skin_mask is not None:
             arr = fg_skin_texture(arr, skin_mask, rng)
+            skin_applied = True
             log(f"  [P5] Skin texture applied (4 layers)")
         else:
             log(f"  [P5] No skin detected, skipping texture")
@@ -906,11 +909,11 @@ def pass5_filmgrade(image, seed):
         out = Image.fromarray(arr.astype("uint8"))
         out = fg.jpeg_compress(out, fg.DEAI["jpeg_quality"])
 
-        log(f"  [P5] Filmgrade + skin texture + anti-AI applied (grain_sigma=3.5)")
-        return out
+        log(f"  [P5] Filmgrade + anti-AI applied (grain_sigma=3.5, skin={skin_applied})")
+        return out, skin_applied
     except Exception as e:
         log(f"  [P5] Filmgrade failed: {e}")
-        return image
+        return image, False
 
 
 # ---------------------------------------------------------------------------
@@ -1083,10 +1086,13 @@ def handler(job):
             gc.collect()
             torch.cuda.empty_cache()
 
-        # ── Pass 5: Filmgrade ──
+        # ── Pass 5: Filmgrade + Skin Texture ──
+        skin_texture_applied = False
         if not no_filmgrade:
-            image = pass5_filmgrade(image, seed)
+            image, skin_texture_applied = pass5_filmgrade(image, seed)
             passes_run.append("filmgrade")
+            if skin_texture_applied:
+                passes_run.append("skin_texture")
 
         # Encode output
         buf = io.BytesIO()
@@ -1102,6 +1108,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
+            "handler_version": "v2.1-skin-texture",
         }
 
     except Exception as e:
