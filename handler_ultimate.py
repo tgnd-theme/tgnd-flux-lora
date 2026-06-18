@@ -333,9 +333,21 @@ def load_loras_for_escort(lora_configs):
         local_path = download_lora(url)
         adapter_name = f"adapter_{i}"
 
-        img2img_pipe.load_lora_weights(local_path, adapter_name=adapter_name)
-        adapter_names.append(adapter_name)
-        adapter_weights.append(scale)
+        try:
+            img2img_pipe.load_lora_weights(local_path, adapter_name=adapter_name)
+            # Verify adapter was actually registered
+            present = set()
+            for comp in [img2img_pipe.transformer, img2img_pipe.text_encoder, img2img_pipe.text_encoder_2]:
+                if hasattr(comp, 'peft_config'):
+                    present.update(comp.peft_config.keys())
+            if adapter_name in present:
+                adapter_names.append(adapter_name)
+                adapter_weights.append(scale)
+                log(f"  LoRA {adapter_name} ({trigger}) loaded OK")
+            else:
+                log(f"  LoRA {adapter_name} ({trigger}) loaded but not present (incompatible keys?), skipping")
+        except Exception as e:
+            log(f"  LoRA {adapter_name} ({trigger}) failed: {e}")
 
     if adapter_names:
         img2img_pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
