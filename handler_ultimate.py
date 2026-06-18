@@ -276,26 +276,67 @@ def load_fix_models():
 # LoRA Loading (per-request, cached)
 # ---------------------------------------------------------------------------
 
+def is_bfl_format(filepath):
+    """Check if a LoRA file uses BFL/ComfyUI key naming (not diffusers)."""
+    from safetensors import safe_open
+    with safe_open(filepath, framework="pt") as f:
+        keys = f.keys()
+        return any("diffusion_model." in k for k in keys)
+
+
+def convert_bfl_to_diffusers(filepath):
+    """Convert BFL/ComfyUI format LoRA to diffusers format using built-in converter."""
+    converted_path = filepath.replace(".safetensors", "_diffusers.safetensors")
+    if os.path.exists(converted_path):
+        log(f"  Using cached converted LoRA: {converted_path}")
+        return converted_path
+
+    log(f"  Converting BFL format LoRA to diffusers format...")
+    t0 = time.time()
+    try:
+        from diffusers.loaders.lora_conversion_utils import _convert_non_diffusers_lora_to_diffusers
+        from safetensors.torch import load_file, save_file
+
+        state_dict = load_file(filepath)
+        converted = _convert_non_diffusers_lora_to_diffusers(
+            "FluxTransformer2DModel", state_dict
+        )
+        save_file(converted, converted_path)
+        log(f"  Converted: {len(state_dict)}→{len(converted)} keys in {time.time()-t0:.1f}s")
+        return converted_path
+    except ImportError:
+        log(f"  WARNING: _convert_non_diffusers_lora_to_diffusers not available")
+        return filepath
+    except Exception as e:
+        log(f"  WARNING: BFL conversion failed: {e}")
+        return filepath
+
+
 def download_lora(url):
-    """Download a LoRA file and cache it on the network volume."""
+    """Download a LoRA file and cache it on the network volume.
+    Auto-converts BFL/ComfyUI format to diffusers format if needed."""
     filename = hashlib.md5(url.encode()).hexdigest() + ".safetensors"
     local_path = os.path.join(LORA_CACHE, filename)
 
-    if os.path.exists(local_path):
-        return local_path
+    if not os.path.exists(local_path):
+        import requests
+        log(f"Downloading LoRA: {url[:80]}...")
+        t0 = time.time()
+        resp = requests.get(url, timeout=120)
+        resp.raise_for_status()
 
-    import requests
-    log(f"Downloading LoRA: {url[:80]}...")
-    t0 = time.time()
-    resp = requests.get(url, timeout=120)
-    resp.raise_for_status()
+        os.makedirs(LORA_CACHE, exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(resp.content)
 
-    os.makedirs(LORA_CACHE, exist_ok=True)
-    with open(local_path, "wb") as f:
-        f.write(resp.content)
+        size_mb = len(resp.content) / 1024 / 1024
+        log(f"LoRA cached: {local_path} ({size_mb:.1f}MB) in {time.time()-t0:.1f}s")
 
-    size_mb = len(resp.content) / 1024 / 1024
-    log(f"LoRA cached: {local_path} ({size_mb:.1f}MB) in {time.time()-t0:.1f}s")
+    # Auto-convert BFL/ComfyUI format to diffusers
+    if is_bfl_format(local_path):
+        log(f"  Detected BFL/ComfyUI format LoRA — converting...")
+        local_path = convert_bfl_to_diffusers(local_path)
+
     return local_path
 
 
