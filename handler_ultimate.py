@@ -28,6 +28,8 @@ Input schema:
     "body_overrides": {             # Optional overrides
         "cup": "B", "butt": "round", "build": "slim", "height": "average"
     },
+    "body_reference_url": str,      # Optional body ref photo (IP-Adapter conditioning)
+    "ip_adapter_scale": float,      # IP-Adapter influence (default: 0.5)
     "strength": float,              # default: 0.80
     "guidance": float,              # default: 5.0
     "seed": int,
@@ -121,6 +123,8 @@ face_parser_net = None
 face_parser_transform = None
 gfpgan_restorer = None
 loaded_lora_hash = None  # hash of currently loaded LoRA config
+ip_adapter_helper = None  # Helper pipeline for IP-Adapter body conditioning
+ip_adapter_loaded = False
 
 
 def log(msg):
@@ -276,6 +280,116 @@ def load_fix_models():
         except Exception as e:
             log(f"GFPGAN not available: {e}")
             gfpgan_restorer = False
+
+
+# ---------------------------------------------------------------------------
+# IP-Adapter for Body Preservation (optional, loaded on first use)
+# ---------------------------------------------------------------------------
+
+def load_ip_adapter_model():
+    """Load XLabs IP-Adapter via helper pipeline that shares the transformer.
+
+    FluxControlNetImg2ImgPipeline doesn't have load_ip_adapter natively,
+    but FluxControlNetPipeline does. Since they share the same transformer,
+    loading IP-Adapter into the helper modifies the transformer's attention
+    processors, which then work when called from either pipeline.
+    """
+    global ip_adapter_helper, ip_adapter_loaded
+    if ip_adapter_loaded:
+        return
+
+    t0 = time.time()
+    log("Loading IP-Adapter (XLabs-AI) for body preservation...")
+
+    from diffusers import FluxControlNetPipeline
+
+    # Create helper pipeline sharing all components with img2img_pipe
+    ip_adapter_helper = FluxControlNetPipeline(
+        transformer=img2img_pipe.transformer,
+        text_encoder=img2img_pipe.text_encoder,
+        text_encoder_2=img2img_pipe.text_encoder_2,
+        vae=img2img_pipe.vae,
+        scheduler=img2img_pipe.scheduler,
+        tokenizer=img2img_pipe.tokenizer,
+        tokenizer_2=img2img_pipe.tokenizer_2,
+        controlnet=controlnet,
+    )
+
+    # Load XLabs IP-Adapter (CLIP-ViT-L image encoder)
+    ip_adapter_helper.load_ip_adapter(
+        "XLabs-AI/flux-ip-adapter",
+        weight_name="ip_adapter.safetensors",
+        image_encoder_pretrained_model_name_or_path="openai/clip-vit-large-patch14",
+    )
+
+    ip_adapter_loaded = True
+    vram = torch.cuda.max_memory_allocated() / 1e9
+    log(f"IP-Adapter loaded in {time.time()-t0:.1f}s, VRAM: {vram:.1f}GB")
+
+
+def blur_face_in_body_ref(image):
+    """Blur face region in body reference so IP-Adapter only conditions on body.
+
+    Uses SegFormer B2 face detection (class 11) + dilated mask + heavy blur.
+    Face identity comes from face LoRA, not from IP-Adapter.
+    """
+    import cv2
+
+    load_segformer()
+    seg_map = segment_body(image)
+
+    # Class 11 = Face, also include 2 = Hair to be safe
+    face_mask = np.zeros_like(seg_map, dtype=np.uint8)
+    for cid in [2, 11]:  # Hair + Face
+        face_mask[seg_map == cid] = 255
+
+    if face_mask.sum() < 100:
+        log("  [IPA] No face detected in body ref, using as-is")
+        return image
+
+    # Expand face mask generously to catch ears, hairline, jawline
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (50, 50))
+    face_mask = cv2.dilate(face_mask, kernel, iterations=1)
+
+    # Heavy Gaussian blur on face region
+    img_np = np.array(image)
+    blurred = cv2.GaussianBlur(img_np, (99, 99), 30)
+
+    # Blend: face = blurred, body = original
+    mask_f = (face_mask / 255.0)[..., np.newaxis].astype(np.float32)
+    result = img_np * (1 - mask_f) + blurred * mask_f
+
+    face_pct = face_mask.sum() / (face_mask.size * 255) * 100
+    log(f"  [IPA] Face blurred in body ref ({face_pct:.1f}% of image)")
+    return Image.fromarray(result.astype(np.uint8))
+
+
+def prepare_body_ip_embeddings(body_ref_image, scale=0.5):
+    """Encode body reference image for IP-Adapter conditioning.
+
+    1. Blur face region to isolate body features
+    2. Set IP-Adapter scale
+    3. Encode image into embeddings via CLIP-ViT-L
+    """
+    load_ip_adapter_model()
+
+    # Blur face so IP-Adapter only captures body features
+    body_ref_processed = blur_face_in_body_ref(body_ref_image)
+
+    # Set scale for this request
+    ip_adapter_helper.set_ip_adapter_scale(scale)
+
+    # Encode body reference
+    embeds = ip_adapter_helper.prepare_ip_adapter_image_embeds(
+        ip_adapter_image=body_ref_processed,
+        ip_adapter_image_embeds=None,
+        device="cuda",
+        num_images_per_prompt=1,
+        do_classifier_free_guidance=False,
+    )
+
+    log(f"  [IPA] Body embeddings prepared (scale={scale})")
+    return embeds
 
 
 # ---------------------------------------------------------------------------
@@ -521,8 +635,8 @@ def build_full_prompt(body_desc, expression_hint, scene_prompt, clothing_prompt=
 # ---------------------------------------------------------------------------
 
 def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
-                   width=768, height=1024):
-    """Generate base image with img2img + dual ControlNet + LoRAs."""
+                   width=768, height=1024, ip_adapter_embeds=None):
+    """Generate base image with img2img + dual ControlNet + LoRAs + optional IP-Adapter."""
     t0 = time.time()
 
     ref_resized = ref_image.resize((width, height), Image.LANCZOS)
@@ -535,6 +649,14 @@ def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
     pose_map = extract_pose(ref_image, (width, height))
 
     generator = torch.Generator("cuda").manual_seed(seed)
+
+    # IP-Adapter body conditioning via joint_attention_kwargs
+    extra_kwargs = {}
+    if ip_adapter_embeds is not None:
+        extra_kwargs["joint_attention_kwargs"] = {
+            "ip_adapter_image_embeds": ip_adapter_embeds,
+        }
+        log("  [P1] IP-Adapter body conditioning active")
 
     if pose_map is not None:
         control_images = [depth_map, pose_map]
@@ -555,6 +677,7 @@ def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
             num_inference_steps=30,
             guidance_scale=guidance,
             generator=generator,
+            **extra_kwargs,
         )
     else:
         # Fallback: depth only
@@ -571,6 +694,7 @@ def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
             num_inference_steps=30,
             guidance_scale=guidance,
             generator=generator,
+            **extra_kwargs,
         )
 
     image = result.images[0]
@@ -1085,6 +1209,10 @@ def handler(job):
         skip_fix = bool(inp.get("skip_fix", False))
         no_filmgrade = bool(inp.get("no_filmgrade", False))
 
+        # IP-Adapter body conditioning
+        body_ref_url = inp.get("body_reference_url", "")
+        ip_adapter_scale = float(inp.get("ip_adapter_scale", 0.5))
+
         # Build body description
         if not body_description:
             body_description = build_body_description(lora_configs, body_overrides)
@@ -1095,6 +1223,8 @@ def handler(job):
         log(f"Starting generation: seed={seed}, strength={strength}, guidance={guidance}")
         log(f"  Prompt: {full_prompt[:120]}...")
         log(f"  Fix passes: {'OFF' if skip_fix else 'ON'}, Filmgrade: {'OFF' if no_filmgrade else 'ON'}")
+        if body_ref_url:
+            log(f"  IP-Adapter body ref: {body_ref_url[:60]}... (scale={ip_adapter_scale})")
 
         total_t0 = time.time()
         passes_run = []
@@ -1103,8 +1233,19 @@ def handler(job):
         ref_image = download_image(lookbook_url)
         ref_image = remove_watermark(ref_image)
 
+        # Prepare IP-Adapter body conditioning (if body reference provided)
+        ip_adapter_embeds = None
+        if body_ref_url:
+            try:
+                body_ref_image = download_image(body_ref_url)
+                ip_adapter_embeds = prepare_body_ip_embeddings(body_ref_image, ip_adapter_scale)
+                passes_run.append("ip_adapter_body")
+            except Exception as e:
+                log(f"  WARNING: IP-Adapter failed ({e}), proceeding without body conditioning")
+
         # ── Pass 1: Base Generation ──
-        image = pass1_generate(ref_image, full_prompt, strength, seed, guidance)
+        image = pass1_generate(ref_image, full_prompt, strength, seed, guidance,
+                               ip_adapter_embeds=ip_adapter_embeds)
         passes_run.append("base")
 
         # ── Fix Passes (2, 3, 3e, 3d) ──
@@ -1193,7 +1334,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.10-degloss",
+            "handler_version": "v3.0-ipadapter",
             "skin_debug": _skin_mask_error,
         }
 
