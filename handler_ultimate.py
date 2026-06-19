@@ -123,7 +123,6 @@ face_parser_net = None
 face_parser_transform = None
 gfpgan_restorer = None
 loaded_lora_hash = None  # hash of currently loaded LoRA config
-ip_adapter_helper = None  # Helper pipeline for IP-Adapter body conditioning
 ip_adapter_loaded = False
 
 
@@ -287,36 +286,20 @@ def load_fix_models():
 # ---------------------------------------------------------------------------
 
 def load_ip_adapter_model():
-    """Load XLabs IP-Adapter via helper pipeline that shares the transformer.
+    """Load XLabs IP-Adapter directly on img2img_pipe.
 
-    FluxControlNetImg2ImgPipeline doesn't have load_ip_adapter natively,
-    but FluxPipeline (txt2img) does via FluxIPAdapterMixin. Since they share
-    the same transformer, loading IP-Adapter into the helper modifies the
-    transformer's attention processors, which then work from either pipeline.
+    diffusers >= 0.39 supports load_ip_adapter on FluxControlNetImg2ImgPipeline
+    natively via FluxIPAdapterMixin.
     """
-    global ip_adapter_helper, ip_adapter_loaded
+    global ip_adapter_loaded
     if ip_adapter_loaded:
         return
 
     t0 = time.time()
     log("Loading IP-Adapter (XLabs-AI) for body preservation...")
 
-    from diffusers import FluxPipeline
-
-    # Create helper pipeline sharing all components with img2img_pipe
-    # Use FluxPipeline (not FluxControlNetPipeline) — simpler, no controlnet needed
-    ip_adapter_helper = FluxPipeline(
-        transformer=img2img_pipe.transformer,
-        text_encoder=img2img_pipe.text_encoder,
-        text_encoder_2=img2img_pipe.text_encoder_2,
-        vae=img2img_pipe.vae,
-        scheduler=img2img_pipe.scheduler,
-        tokenizer=img2img_pipe.tokenizer,
-        tokenizer_2=img2img_pipe.tokenizer_2,
-    )
-
-    # Load XLabs IP-Adapter (CLIP-ViT-L image encoder)
-    ip_adapter_helper.load_ip_adapter(
+    # Load XLabs IP-Adapter directly on the main pipeline
+    img2img_pipe.load_ip_adapter(
         "XLabs-AI/flux-ip-adapter",
         weight_name="ip_adapter.safetensors",
         image_encoder_pretrained_model_name_or_path="openai/clip-vit-large-patch14",
@@ -377,10 +360,10 @@ def prepare_body_ip_embeddings(body_ref_image, scale=0.5):
     body_ref_processed = blur_face_in_body_ref(body_ref_image)
 
     # Set scale for this request
-    ip_adapter_helper.set_ip_adapter_scale(scale)
+    img2img_pipe.set_ip_adapter_scale(scale)
 
     # Encode body reference
-    embeds = ip_adapter_helper.prepare_ip_adapter_image_embeds(
+    embeds = img2img_pipe.prepare_ip_adapter_image_embeds(
         ip_adapter_image=body_ref_processed,
         ip_adapter_image_embeds=None,
         device="cuda",
