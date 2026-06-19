@@ -775,47 +775,87 @@ def pass3d_restore_face(image, weight=0.7):
 
 _skin_mask_error = None  # Global to report errors in output
 
-def get_skin_mask(image):
-    """Get skin-only mask using SegFormer B2. Returns (H, W) float 0-1 or None.
 
-    Uses mattmdjaga/segformer_b2_clothes classes:
-    Skin = Face (11) + Left-leg (12) + Right-leg (13) + Left-arm (14) + Right-arm (15)
+def get_skin_mask_hsv(image):
+    """Fallback skin detection using HSV color range. Always works, no model needed."""
+    import cv2
+    arr = np.asarray(image)
+    hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
+
+    # Standard skin color ranges in HSV
+    lower1 = np.array([0, 30, 60], dtype=np.uint8)
+    upper1 = np.array([20, 180, 255], dtype=np.uint8)
+    lower2 = np.array([160, 30, 60], dtype=np.uint8)
+    upper2 = np.array([180, 180, 255], dtype=np.uint8)
+
+    mask1 = cv2.inRange(hsv, lower1, upper1)
+    mask2 = cv2.inRange(hsv, lower2, upper2)
+    skin_raw = cv2.bitwise_or(mask1, mask2)
+
+    # Clean up: morphological open (remove noise) then close (fill gaps)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    skin_raw = cv2.morphologyEx(skin_raw, cv2.MORPH_OPEN, kernel)
+    skin_raw = cv2.morphologyEx(skin_raw, cv2.MORPH_CLOSE, kernel)
+
+    # Smooth edges
+    skin_pil = Image.fromarray(skin_raw)
+    skin_pil = skin_pil.filter(ImageFilter.GaussianBlur(radius=5))
+    skin_mask = np.asarray(skin_pil, dtype=np.float32) / 255.0
+
+    return skin_mask
+
+
+def get_skin_mask(image):
+    """Get skin mask. Tries SegFormer B2 first, falls back to HSV color detection.
+
+    SegFormer B2 classes: Face(11) Left-leg(12) Right-leg(13) Left-arm(14) Right-arm(15)
+    HSV fallback: standard skin color ranges, always works.
     """
     global _skin_mask_error
+
+    # --- Method 1: SegFormer B2 (precise, model-based) ---
     try:
         import cv2
-        log(f"  [P5] Running SegFormer skin detection (model loaded: {segformer_model is not None})")
-        seg_map = segment_body(image)
-        unique_classes = np.unique(seg_map).tolist()
-        log(f"  [P5] SegFormer classes found: {unique_classes}")
-        skin_binary = np.isin(seg_map, SEG_SKIN_IDS).astype(np.float32)
-        skin_pct_raw = skin_binary.mean() * 100
-        log(f"  [P5] Raw skin coverage: {skin_pct_raw:.1f}%")
+        if segformer_model is not None:
+            log(f"  [P5] Trying SegFormer skin detection...")
+            seg_map = segment_body(image)
+            unique_classes = np.unique(seg_map).tolist()
+            log(f"  [P5] SegFormer classes: {unique_classes}")
+            skin_binary = np.isin(seg_map, SEG_SKIN_IDS).astype(np.float32)
+            skin_pct_raw = skin_binary.mean() * 100
 
-        if skin_binary.max() < 0.01:
-            log(f"  [P5] No skin pixels detected, skipping texture")
-            _skin_mask_error = f"no_skin_pixels (classes={unique_classes})"
-            return None
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (6, 6))
-        skin_binary = cv2.erode(skin_binary, kernel, iterations=1)
-
-        skin_pil = Image.fromarray((skin_binary * 255).astype("uint8"))
-        skin_pil = skin_pil.filter(ImageFilter.GaussianBlur(radius=5))
-        skin_mask = np.asarray(skin_pil, dtype=np.float32) / 255.0
-        skin_pct = skin_mask.mean() * 100
-        log(f"  [P5] Skin mask: {skin_pct:.1f}% coverage (after erosion+blur)")
-
-        if skin_mask.max() < 0.01:
-            _skin_mask_error = f"skin_eroded_away (raw={skin_pct_raw:.1f}%)"
-            return None
-
-        return skin_mask
+            if skin_pct_raw > 0.5:
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (6, 6))
+                skin_binary = cv2.erode(skin_binary, kernel, iterations=1)
+                skin_pil = Image.fromarray((skin_binary * 255).astype("uint8"))
+                skin_pil = skin_pil.filter(ImageFilter.GaussianBlur(radius=5))
+                skin_mask = np.asarray(skin_pil, dtype=np.float32) / 255.0
+                skin_pct = skin_mask.mean() * 100
+                if skin_pct > 0.1:
+                    log(f"  [P5] SegFormer skin mask: {skin_pct:.1f}% coverage")
+                    _skin_mask_error = None
+                    return skin_mask
+            log(f"  [P5] SegFormer: only {skin_pct_raw:.1f}% skin, falling back to HSV")
+        else:
+            log(f"  [P5] SegFormer not loaded, falling back to HSV")
     except Exception as e:
-        import traceback
-        _skin_mask_error = f"{type(e).__name__}: {e}"
-        log(f"  [P5] Skin mask extraction failed: {e}")
-        log(traceback.format_exc())
+        log(f"  [P5] SegFormer failed ({e}), falling back to HSV")
+
+    # --- Method 2: HSV color detection (fallback, always works) ---
+    try:
+        skin_mask = get_skin_mask_hsv(image)
+        skin_pct = skin_mask.mean() * 100
+        if skin_pct > 0.5:
+            log(f"  [P5] HSV skin mask: {skin_pct:.1f}% coverage")
+            _skin_mask_error = f"hsv_fallback ({skin_pct:.1f}%)"
+            return skin_mask
+        else:
+            log(f"  [P5] HSV: only {skin_pct:.1f}% skin, no texture applied")
+            _skin_mask_error = f"hsv_too_low ({skin_pct:.1f}%)"
+            return None
+    except Exception as e:
+        _skin_mask_error = f"both_failed: {e}"
+        log(f"  [P5] HSV fallback also failed: {e}")
         return None
 
 
@@ -1130,7 +1170,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.3-debug-skin",
+            "handler_version": "v2.4-hsv-fallback",
             "skin_debug": _skin_mask_error,
         }
 
