@@ -123,6 +123,7 @@ face_parser_net = None
 face_parser_transform = None
 gfpgan_restorer = None
 loaded_lora_hash = None  # hash of currently loaded LoRA config
+ip_adapter_helper = None  # Helper pipeline for IP-Adapter loading
 ip_adapter_loaded = False
 
 
@@ -286,20 +287,35 @@ def load_fix_models():
 # ---------------------------------------------------------------------------
 
 def load_ip_adapter_model():
-    """Load XLabs IP-Adapter directly on img2img_pipe.
+    """Load XLabs IP-Adapter via helper pipeline that shares the transformer.
 
-    diffusers >= 0.39 supports load_ip_adapter on FluxControlNetImg2ImgPipeline
-    natively via FluxIPAdapterMixin.
+    FluxControlNetImg2ImgPipeline doesn't have load_ip_adapter (needs diffusers 0.39+),
+    but FluxPipeline does. Since they share the same transformer, load_ip_adapter
+    modifies the transformer's attention processors and encoder_hid_proj, which then
+    work when the transformer is called from either pipeline.
     """
-    global ip_adapter_loaded
+    global ip_adapter_helper, ip_adapter_loaded
     if ip_adapter_loaded:
         return
 
     t0 = time.time()
     log("Loading IP-Adapter (XLabs-AI) for body preservation...")
 
-    # Load XLabs IP-Adapter directly on the main pipeline
-    img2img_pipe.load_ip_adapter(
+    from diffusers import FluxPipeline
+
+    # Create helper pipeline sharing all components with img2img_pipe
+    ip_adapter_helper = FluxPipeline(
+        transformer=img2img_pipe.transformer,
+        text_encoder=img2img_pipe.text_encoder,
+        text_encoder_2=img2img_pipe.text_encoder_2,
+        vae=img2img_pipe.vae,
+        scheduler=img2img_pipe.scheduler,
+        tokenizer=img2img_pipe.tokenizer,
+        tokenizer_2=img2img_pipe.tokenizer_2,
+    )
+
+    # Load XLabs IP-Adapter — this modifies the shared transformer
+    ip_adapter_helper.load_ip_adapter(
         "XLabs-AI/flux-ip-adapter",
         weight_name="ip_adapter.safetensors",
         image_encoder_pretrained_model_name_or_path="openai/clip-vit-large-patch14",
@@ -360,15 +376,14 @@ def prepare_body_ip_embeddings(body_ref_image, scale=0.5):
     body_ref_processed = blur_face_in_body_ref(body_ref_image)
 
     # Set scale for this request
-    img2img_pipe.set_ip_adapter_scale(scale)
+    ip_adapter_helper.set_ip_adapter_scale(scale)
 
-    # Encode body reference
-    embeds = img2img_pipe.prepare_ip_adapter_image_embeds(
-        ip_adapter_image=body_ref_processed,
+    # Encode body reference via helper pipeline (shares transformer with img2img_pipe)
+    embeds = ip_adapter_helper.prepare_ip_adapter_image_embeds(
+        ip_adapter_image=[body_ref_processed],
         ip_adapter_image_embeds=None,
         device="cuda",
         num_images_per_prompt=1,
-        do_classifier_free_guidance=False,
     )
 
     log(f"  [IPA] Body embeddings prepared (scale={scale})")
@@ -634,11 +649,21 @@ def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
     generator = torch.Generator("cuda").manual_seed(seed)
 
     # IP-Adapter body conditioning via joint_attention_kwargs
+    # The transformer's forward() pops ip_adapter_image_embeds from the dict,
+    # so we use a PersistentDict that re-adds the key after each pop.
     extra_kwargs = {}
     if ip_adapter_embeds is not None:
-        extra_kwargs["joint_attention_kwargs"] = {
-            "ip_adapter_image_embeds": ip_adapter_embeds,
-        }
+        class PersistentIPADict(dict):
+            """Dict that re-adds ip_adapter_image_embeds after pop."""
+            def pop(self, key, *args):
+                val = super().pop(key, *args)
+                if key == "ip_adapter_image_embeds":
+                    self[key] = ip_adapter_embeds
+                return val
+
+        extra_kwargs["joint_attention_kwargs"] = PersistentIPADict(
+            ip_adapter_image_embeds=ip_adapter_embeds,
+        )
         log("  [P1] IP-Adapter body conditioning active")
 
     if pose_map is not None:

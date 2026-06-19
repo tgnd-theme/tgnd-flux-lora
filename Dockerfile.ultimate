@@ -12,7 +12,7 @@ RUN pip install --no-cache-dir \
 # gfpgan for face restoration (pass 3d)
 RUN pip install --no-cache-dir \
     runpod \
-    'diffusers @ git+https://github.com/huggingface/diffusers.git@main' \
+    'diffusers>=0.38.0' \
     'transformers>=4.50.0,<4.52.0' \
     accelerate \
     safetensors \
@@ -39,13 +39,12 @@ RUN pip install --no-cache-dir basicsr && \
 # Verify critical imports work at build time
 # DWposeDetector and GFPGANer loaded lazily at runtime
 RUN python3 -c "\
-import diffusers; print(f'diffusers {diffusers.__version__}'); \
 from diffusers import FluxControlNetImg2ImgPipeline, FluxControlNetModel, FluxMultiControlNetModel; \
 from diffusers import FluxControlNetInpaintPipeline; \
-assert hasattr(FluxControlNetImg2ImgPipeline, 'load_ip_adapter'), 'IP-Adapter support missing — need diffusers >= 0.39'; \
+from diffusers import FluxPipeline; \
 import mediapipe; \
 from gfpgan import GFPGANer; \
-print('Flux 1 + ControlNet + Inpaint + IP-Adapter + MediaPipe + GFPGAN imports OK')"
+print('Flux 1 + ControlNet + Inpaint + MediaPipe + GFPGAN imports OK')"
 
 # Copy handler + utilities
 COPY handler_ultimate.py /app/handler.py
