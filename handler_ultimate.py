@@ -947,7 +947,9 @@ def pass5_filmgrade(image, seed):
         p = fg.PRESETS["ouatih"]
         p = dict(p, grain_sigma=3.5)  # v12b golden standard
 
-        rng = np.random.RandomState(seed % (2**31))
+        # MUST use default_rng (Generator) — filmgrade.py uses rng.integers()
+        # which does NOT exist on np.random.RandomState
+        rng = np.random.default_rng(seed % (2**31))
         arr = np.asarray(image, dtype=float)
 
         # Step 1: Filmgrade (color, warmth, grain)
@@ -974,8 +976,12 @@ def pass5_filmgrade(image, seed):
         log(f"  [P5] Filmgrade + anti-AI applied (grain_sigma=3.5, skin={skin_applied})")
         return out, skin_applied
     except Exception as e:
-        log(f"  [P5] Filmgrade failed: {e}")
-        return image, False
+        log(f"  [P5] Filmgrade failed: {e}, traceback: {traceback.format_exc()}")
+        # Return partially processed image if we got past filmgrade steps
+        try:
+            return Image.fromarray(arr.astype("uint8")), skin_applied
+        except Exception:
+            return image, False
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1176,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.4-hsv-fallback",
+            "handler_version": "v2.5-rng-fix",
             "skin_debug": _skin_mask_error,
         }
 
