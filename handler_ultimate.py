@@ -923,7 +923,7 @@ def fg_skin_texture(arr, skin_mask, rng):
         disrupt = cv2.GaussianBlur(disrupt, (0, 0), sigmaX=1.0)
         disrupt = disrupt - cv2.GaussianBlur(disrupt, (0, 0), sigmaX=3.5)
         intensity = np.clip((brightness - 0.75) / 0.25, 0, 1)
-        img = img - disrupt * 8.0 * hl_mask * intensity
+        img = img - (disrupt * 8.0 * hl_mask * intensity)[..., None]
 
     # --- Layer 4: Blood perfusion ---
     perf_grid = rng.normal(0, 1, ((h + 49) // 50, (w + 49) // 50)).astype(np.float32)
@@ -1180,7 +1180,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.6-debug-skin",
+            "handler_version": "v2.7-skin-fix",
             "skin_debug": _skin_mask_error,
         }
 
