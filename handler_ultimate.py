@@ -909,7 +909,7 @@ def fg_skin_texture(arr, skin_mask, rng):
         synth = pore_bp * 0.6 + mid_bp * 0.4
         synth_std = float(np.std(synth))
         if synth_std > 0:
-            synth = synth * (deficit / synth_std) * 0.35
+            synth = synth * (deficit / synth_std) * 0.55
         tex_rgb = np.stack([synth * 1.05, synth * 0.95, synth * 0.88], axis=-1)
         midtone = np.clip(1.0 - np.abs(lum - 0.47) / 0.4, 0.3, 1.0)
         img = img + tex_rgb * (sm * midtone)[..., None]
@@ -923,16 +923,16 @@ def fg_skin_texture(arr, skin_mask, rng):
         disrupt = cv2.GaussianBlur(disrupt, (0, 0), sigmaX=1.0)
         disrupt = disrupt - cv2.GaussianBlur(disrupt, (0, 0), sigmaX=3.5)
         intensity = np.clip((brightness - 0.75) / 0.25, 0, 1)
-        img = img - (disrupt * 8.0 * hl_mask * intensity)[..., None]
+        img = img - (disrupt * 12.0 * hl_mask * intensity)[..., None]
 
     # --- Layer 4: Blood perfusion ---
     perf_grid = rng.normal(0, 1, ((h + 49) // 50, (w + 49) // 50)).astype(np.float32)
     perfusion = cv2.resize(perf_grid, (w, h), interpolation=cv2.INTER_CUBIC)
     perf2_grid = rng.normal(0, 1, ((h + 19) // 20, (w + 19) // 20)).astype(np.float32)
     perfusion2 = cv2.resize(perf2_grid, (w, h), interpolation=cv2.INTER_CUBIC)
-    color_shift = (perfusion * 0.6 + perfusion2 * 0.4) * 1.5
-    img[..., 0] += color_shift * sm * 1.1
-    img[..., 1] -= color_shift * sm * 0.3
+    color_shift = (perfusion * 0.6 + perfusion2 * 0.4) * 2.5
+    img[..., 0] += color_shift * sm * 1.3
+    img[..., 1] -= color_shift * sm * 0.4
 
     return np.clip(img, 0, 255)
 
@@ -1180,7 +1180,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.8-preload",
+            "handler_version": "v2.9-antiAI",
             "skin_debug": _skin_mask_error,
         }
 

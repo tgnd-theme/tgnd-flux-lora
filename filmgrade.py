@@ -62,29 +62,29 @@ PRESETS = {
 # Anti-AI parameters — breekt de perfecte AI-glans
 DEAI = dict(
     # Micro-texture: fijne huidachtige textuur over het beeld
-    micro_texture_sigma=2.5,     # sterkte van micro-texture noise
+    micro_texture_sigma=4.0,     # sterkte van micro-texture noise (was 2.5)
     micro_texture_scale=3,       # schaal van textuurpatroon (pixels)
 
     # Chromatische aberratie: lichte kleurverschuiving aan beeldranden
-    chroma_aberration=1.2,       # pixels verschuiving aan uiterste rand
+    chroma_aberration=1.5,       # pixels verschuiving aan uiterste rand (was 1.2)
 
     # Lokale scherpte variatie: niet alles pin-sharp
-    local_blur_strength=0.3,     # blend met licht geblurde versie
-    local_blur_radius=1.0,       # radius van de zachte blur
+    local_blur_strength=0.35,    # blend met licht geblurde versie (was 0.3)
+    local_blur_radius=1.2,       # radius van de zachte blur (was 1.0)
 
     # Sensor noise: per-kanaal noise zoals echte camera sensor
-    sensor_noise_r=3.0,          # rood kanaal noise sigma
-    sensor_noise_g=2.0,          # groen kanaal noise (minst, meeste photosites)
-    sensor_noise_b=3.5,          # blauw kanaal noise (meest, minste photosites)
+    sensor_noise_r=4.5,          # rood kanaal noise sigma (was 3.0)
+    sensor_noise_g=3.0,          # groen kanaal noise (was 2.0)
+    sensor_noise_b=5.0,          # blauw kanaal noise (was 3.5)
 
     # Hot pixels: zeldzame heldere puntjes zoals echte sensoren
-    hot_pixel_chance=0.00003,    # kans per pixel
+    hot_pixel_chance=0.00005,    # kans per pixel (was 0.00003)
 
     # Luminance-dependent noise: meer noise in schaduwen (zoals echte camera)
-    shadow_noise_boost=2.0,      # extra noise in donkere gebieden
+    shadow_noise_boost=2.5,      # extra noise in donkere gebieden (was 2.0)
 
     # JPEG compressie: echte foto's hebben altijd JPEG artifacts
-    jpeg_quality=82,             # opslaan op 82 ipv 95
+    jpeg_quality=75,             # opslaan op 75 ipv 82 — meer compressie = minder AI-smooth
 )
 
 
