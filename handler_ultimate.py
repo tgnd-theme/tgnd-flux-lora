@@ -290,9 +290,9 @@ def load_ip_adapter_model():
     """Load XLabs IP-Adapter via helper pipeline that shares the transformer.
 
     FluxControlNetImg2ImgPipeline doesn't have load_ip_adapter natively,
-    but FluxControlNetPipeline does. Since they share the same transformer,
-    loading IP-Adapter into the helper modifies the transformer's attention
-    processors, which then work when called from either pipeline.
+    but FluxPipeline (txt2img) does via FluxIPAdapterMixin. Since they share
+    the same transformer, loading IP-Adapter into the helper modifies the
+    transformer's attention processors, which then work from either pipeline.
     """
     global ip_adapter_helper, ip_adapter_loaded
     if ip_adapter_loaded:
@@ -301,10 +301,11 @@ def load_ip_adapter_model():
     t0 = time.time()
     log("Loading IP-Adapter (XLabs-AI) for body preservation...")
 
-    from diffusers import FluxControlNetPipeline
+    from diffusers import FluxPipeline
 
     # Create helper pipeline sharing all components with img2img_pipe
-    ip_adapter_helper = FluxControlNetPipeline(
+    # Use FluxPipeline (not FluxControlNetPipeline) — simpler, no controlnet needed
+    ip_adapter_helper = FluxPipeline(
         transformer=img2img_pipe.transformer,
         text_encoder=img2img_pipe.text_encoder,
         text_encoder_2=img2img_pipe.text_encoder_2,
@@ -312,7 +313,6 @@ def load_ip_adapter_model():
         scheduler=img2img_pipe.scheduler,
         tokenizer=img2img_pipe.tokenizer,
         tokenizer_2=img2img_pipe.tokenizer_2,
-        controlnet=controlnet,
     )
 
     # Load XLabs IP-Adapter (CLIP-ViT-L image encoder)
