@@ -812,6 +812,7 @@ def get_skin_mask(image):
     HSV fallback: standard skin color ranges, always works.
     """
     global _skin_mask_error
+    _skin_mask_error = "not_reached"  # Will be overwritten if we get past any check
 
     # --- Method 1: SegFormer B2 (precise, model-based) ---
     try:
@@ -833,7 +834,7 @@ def get_skin_mask(image):
                 skin_pct = skin_mask.mean() * 100
                 if skin_pct > 0.1:
                     log(f"  [P5] SegFormer skin mask: {skin_pct:.1f}% coverage")
-                    _skin_mask_error = None
+                    _skin_mask_error = f"segformer_ok ({skin_pct:.1f}%)"
                     return skin_mask
             log(f"  [P5] SegFormer: only {skin_pct_raw:.1f}% skin, falling back to HSV")
         else:
@@ -959,13 +960,16 @@ def pass5_filmgrade(image, seed):
         arr = fg.vignette(arr, p["vignette"])
 
         # Step 2: 4-layer skin texture (SSS + pores + specular + perfusion)
+        log(f"  [P5] Calling get_skin_mask... segformer_model={'loaded' if segformer_model is not None else 'None'}")
         skin_mask = get_skin_mask(image)
         if skin_mask is not None:
+            coverage = float(skin_mask.mean() * 100)
+            log(f"  [P5] Got skin mask: {coverage:.1f}% coverage, applying 4-layer texture")
             arr = fg_skin_texture(arr, skin_mask, rng)
             skin_applied = True
             log(f"  [P5] Skin texture applied (4 layers)")
         else:
-            log(f"  [P5] No skin detected, skipping texture")
+            log(f"  [P5] No skin detected (mask is None), skipping texture")
 
         # Step 3: Anti-AI processing
         arr = fg.deai(arr, rng, fg.DEAI)
@@ -1176,7 +1180,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.5-rng-fix",
+            "handler_version": "v2.6-debug-skin",
             "skin_debug": _skin_mask_error,
         }
 
