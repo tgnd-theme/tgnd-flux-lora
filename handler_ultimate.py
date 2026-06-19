@@ -915,15 +915,28 @@ def fg_skin_texture(arr, skin_mask, rng):
         img = img + tex_rgb * (sm * midtone)[..., None]
 
     # --- Layer 3: Specular highlight breaking ---
+    # Two-tier: aggressive on bright highlights (>0.75), subtle on mid-highlights (>0.55)
     brightness = gray / 255.0
-    hl_mask = ((brightness > 0.75) * sm).astype(np.float32)
-    hl_mask = cv2.GaussianBlur(hl_mask, (0, 0), sigmaX=3)
-    if hl_mask.max() > 0.01:
+    # Tier 1: strong breaking on bright highlights
+    hl_bright = ((brightness > 0.70) * sm).astype(np.float32)
+    hl_bright = cv2.GaussianBlur(hl_bright, (0, 0), sigmaX=3)
+    # Tier 2: subtle breaking on mid-range shine (cheek gloss, forehead)
+    hl_mid = ((brightness > 0.50) * (brightness <= 0.70) * sm).astype(np.float32)
+    hl_mid = cv2.GaussianBlur(hl_mid, (0, 0), sigmaX=4)
+    if hl_bright.max() > 0.01 or hl_mid.max() > 0.01:
         disrupt = rng.normal(0, 1, (h, w)).astype(np.float32)
         disrupt = cv2.GaussianBlur(disrupt, (0, 0), sigmaX=1.0)
         disrupt = disrupt - cv2.GaussianBlur(disrupt, (0, 0), sigmaX=3.5)
-        intensity = np.clip((brightness - 0.75) / 0.25, 0, 1)
-        img = img - (disrupt * 12.0 * hl_mask * intensity)[..., None]
+        # Fine pore disruption for mid-highlights
+        disrupt_fine = rng.normal(0, 1, (h, w)).astype(np.float32)
+        disrupt_fine = cv2.GaussianBlur(disrupt_fine, (0, 0), sigmaX=0.7)
+        disrupt_fine = disrupt_fine - cv2.GaussianBlur(disrupt_fine, (0, 0), sigmaX=2.0)
+        intensity_bright = np.clip((brightness - 0.70) / 0.30, 0, 1)
+        intensity_mid = np.clip((brightness - 0.50) / 0.20, 0, 1)
+        # Strong disruption on bright highlights, subtle pore texture on mid-shine
+        total = (disrupt * 14.0 * hl_bright * intensity_bright +
+                 disrupt_fine * 6.0 * hl_mid * intensity_mid)
+        img = img - total[..., None]
 
     # --- Layer 4: Blood perfusion ---
     perf_grid = rng.normal(0, 1, ((h + 49) // 50, (w + 49) // 50)).astype(np.float32)
@@ -1180,7 +1193,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.9-antiAI",
+            "handler_version": "v2.10-degloss",
             "skin_debug": _skin_mask_error,
         }
 
