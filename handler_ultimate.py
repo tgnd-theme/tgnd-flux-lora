@@ -1180,7 +1180,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v2.7-skin-fix",
+            "handler_version": "v2.8-preload",
             "skin_debug": _skin_mask_error,
         }
 
@@ -1191,4 +1191,10 @@ def handler(job):
 
 # ─── RunPod entry point ───
 log("Starting RunPod serverless worker (Ultimate Multi-Pass Generator)...")
+log("Pre-loading base models before accepting jobs...")
+try:
+    load_base_models()
+    log("Base models loaded — worker ready for jobs")
+except Exception as e:
+    log(f"WARNING: Base model pre-load failed ({e}), will retry on first request")
 runpod.serverless.start({"handler": handler})

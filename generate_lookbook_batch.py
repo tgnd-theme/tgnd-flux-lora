@@ -27,7 +27,7 @@ LORA_BASE = f"{STAGING_BASE}/loras"
 # Body LoRA is BFL format — handler auto-converts to diffusers format
 LORAS = [
     {"url": f"{LORA_BASE}/babe_face_v2_aitk.safetensors", "scale": 0.5, "trigger": "babe_model"},
-    {"url": f"{LORA_BASE}/babe_body_v2.safetensors", "scale": 0.9, "trigger": "babe_body"},
+    {"url": f"{LORA_BASE}/babe_body_v2.safetensors", "scale": 0.45, "trigger": "babe_body"},
     {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
 ]
 
