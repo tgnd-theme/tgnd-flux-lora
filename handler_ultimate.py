@@ -1141,25 +1141,58 @@ def pass5_filmgrade(image, seed):
 def load_inpaint_controlnet():
     """Load Alimama inpainting ControlNet (lazily, kept in VRAM for reuse).
 
-    The Alimama model config has extra_condition_channels=4 and in_channels=64,
-    but diffusers 0.38+ ignores extra_condition_channels, so we override
-    in_channels to 68 (64 latent + 4 mask channels) to match the weights.
+    The Alimama model has extra_condition_channels=4 in its config, meaning
+    controlnet_x_embedder needs 68 input channels (64 latent + 4 mask) while
+    x_embedder needs standard 64 channels. diffusers 0.38+ creates both with
+    the same in_channels, causing shape mismatches either way.
+
+    Fix: load with ignore_mismatched_sizes=True (x_embedder loads correctly,
+    controlnet_x_embedder gets random init), then manually replace
+    controlnet_x_embedder with correct 68-channel version from the weights.
     """
     global inpaint_controlnet
     if inpaint_controlnet is not None:
         return
 
     from diffusers import FluxControlNetModel
+    import torch.nn as nn
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
 
-    log("Loading Alimama Inpainting ControlNet (in_channels=68)...")
+    log("Loading Alimama Inpainting ControlNet...")
     t0 = time.time()
 
+    # Step 1: Load model with in_channels=64 (default), ignoring the
+    # controlnet_x_embedder size mismatch (it has 68ch in weights)
     inpaint_controlnet = FluxControlNetModel.from_pretrained(
         "alimama-creative/FLUX.1-dev-Controlnet-Inpainting-Beta",
         torch_dtype=torch.bfloat16,
-        in_channels=68,  # 64 latent + 4 mask (config.extra_condition_channels=4)
+        low_cpu_mem_usage=False,
+        ignore_mismatched_sizes=True,
         cache_dir=MODEL_CACHE,
-    ).to("cuda")
+    )
+
+    # Step 2: Fix controlnet_x_embedder — replace with 68-channel version
+    # and load the actual trained weight from the safetensors file
+    inner_dim = inpaint_controlnet.controlnet_x_embedder.out_features  # 3072
+    has_bias = inpaint_controlnet.controlnet_x_embedder.bias is not None
+
+    new_embedder = nn.Linear(68, inner_dim, bias=has_bias)
+
+    sf_path = hf_hub_download(
+        "alimama-creative/FLUX.1-dev-Controlnet-Inpainting-Beta",
+        "diffusion_pytorch_model.safetensors",
+        cache_dir=MODEL_CACHE,
+    )
+    state_dict = load_file(sf_path)
+    new_embedder.weight.data = state_dict["controlnet_x_embedder.weight"].to(torch.bfloat16)
+    if has_bias and "controlnet_x_embedder.bias" in state_dict:
+        new_embedder.bias.data = state_dict["controlnet_x_embedder.bias"].to(torch.bfloat16)
+
+    inpaint_controlnet.controlnet_x_embedder = new_embedder
+    del state_dict
+
+    inpaint_controlnet = inpaint_controlnet.to("cuda")
 
     vram = torch.cuda.max_memory_allocated() / 1e9
     log(f"Alimama ControlNet loaded in {time.time()-t0:.0f}s, VRAM: {vram:.1f}GB")
