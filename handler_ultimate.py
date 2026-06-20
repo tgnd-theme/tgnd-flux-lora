@@ -561,16 +561,18 @@ def segment_body(image):
 
 
 def get_part_mask(seg_map, class_ids, dilate_px=8):
-    """Create binary mask from segmentation class IDs."""
+    """Create a binary mask for given class IDs with dilation and feathering.
+    Returns PIL Image mask or None if no pixels found (v12b parity)."""
     import cv2
-    mask = np.zeros_like(seg_map, dtype=np.uint8)
-    for cid in class_ids:
-        mask[seg_map == cid] = 255
+    binary = np.isin(seg_map, class_ids).astype(np.uint8) * 255
+    if binary.max() == 0:
+        return None
 
     if dilate_px > 0:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2, dilate_px * 2))
-        mask = cv2.dilate(mask, kernel, iterations=1)
+        binary = cv2.dilate(binary, kernel, iterations=1)
 
+    mask = Image.fromarray(binary).filter(ImageFilter.GaussianBlur(4))
     return mask
 
 
@@ -578,6 +580,21 @@ def get_part_mask(seg_map, class_ids, dilate_px=8):
 # Person (all body) = union of skin + clothing classes
 SEG_PERSON_IDS = [4, 5, 6, 7, 8, 11, 12, 13, 14, 15]  # clothes + skin
 SEG_SKIN_IDS = [11, 12, 13, 14, 15]  # Face, Left-leg, Right-leg, Left-arm, Right-arm
+
+# SegFormer class groups for targeted fix passes (v12b parity)
+SEGFORMER_CLASSES = {
+    "feet": [9, 10],              # Left-shoe + Right-shoe (covers feet area)
+    "legs_lower": [12, 13],       # Left-leg + Right-leg (for foot context)
+    "hands": [14, 15],            # Left-arm + Right-arm extremities
+    "lower_clothing": [5, 6, 7],  # Skirt + Pants + Dress
+    "upper_clothing": [4],        # Upper-clothes
+    "torso_skin": [12, 13, 14, 15],  # Exposed skin: legs + arms (for tan lines)
+}
+
+
+def has_part(seg_map, class_ids, min_pixels=500):
+    """Check if body part is visible (enough pixels detected)."""
+    return int(np.isin(seg_map, class_ids).sum()) >= min_pixels
 
 
 # ---------------------------------------------------------------------------
@@ -683,7 +700,7 @@ def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
             control_mode=cn_modes,
             width=width,
             height=height,
-            num_inference_steps=30,
+            num_inference_steps=50,
             guidance_scale=guidance,
             generator=generator,
             **extra_kwargs,
@@ -700,7 +717,7 @@ def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
             control_mode=[2, 4],
             width=width,
             height=height,
-            num_inference_steps=30,
+            num_inference_steps=50,
             guidance_scale=guidance,
             generator=generator,
             **extra_kwargs,
@@ -715,8 +732,48 @@ def pass1_generate(ref_image, prompt, strength, seed, guidance=5.0,
 # Pass 2: Hand Fix (MediaPipe + Alimama Inpainting)
 # ---------------------------------------------------------------------------
 
+def safe_inpaint(pipe, image, mask, prompt, strength, guidance, steps, seed):
+    """Inpaint with Alimama ControlNet Inpainting on FLUX.1-dev (LoRA compatible!).
+
+    v12b parity: zero masked region in control_image, alpha compositing to preserve
+    original pixels outside mask, controlnet_conditioning_scale=0.9.
+    """
+    generator = torch.Generator("cuda").manual_seed(seed)
+
+    w, h = image.size
+
+    # Create control_image: original with masked area zeroed out
+    img_arr = np.array(image, dtype=np.uint8)
+    mask_arr = np.array(mask.convert("L"), dtype=np.float32) / 255.0
+    control_arr = img_arr.copy().astype(np.float32)
+    control_arr *= (1 - mask_arr[..., None])
+    control_image = Image.fromarray(control_arr.astype(np.uint8))
+
+    result = pipe(
+        prompt=prompt,
+        image=image,
+        mask_image=mask,
+        control_image=control_image,
+        controlnet_conditioning_scale=0.9,
+        strength=strength,
+        guidance_scale=guidance,
+        num_inference_steps=steps,
+        width=w,
+        height=h,
+        generator=generator,
+        joint_attention_kwargs={"scale": 1.0},
+    ).images[0]
+
+    # Composite: keep original pixels where mask is black (0)
+    orig = np.array(image, dtype=float)
+    new = np.array(result, dtype=float)
+    m = mask_arr.astype(float)
+    out = orig * (1 - m[..., None]) + new * m[..., None]
+    return Image.fromarray(out.astype("uint8"))
+
+
 def pass2_fix_hands(inpaint_pipe, image, body_prompt, seed):
-    """Fix hands using MediaPipe detection + inpainting."""
+    """Fix hands using MediaPipe detection + safe_inpaint (v12b parity)."""
     if mediapipe_hands is None or mediapipe_hands is False:
         log("  [P2] MediaPipe not available, skipping hand fix")
         return image
@@ -732,43 +789,32 @@ def pass2_fix_hands(inpaint_pipe, image, body_prompt, seed):
 
     # Create mask from hand landmarks
     h, w = img_np.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
 
-    for hand_landmarks in results.multi_hand_landmarks:
+    for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
         points = []
         for lm in hand_landmarks.landmark:
             px, py = int(lm.x * w), int(lm.y * h)
             points.append((px, py))
 
         if points:
+            mask = np.zeros((h, w), dtype=np.uint8)
             pts = np.array(points, np.int32)
             hull = cv2.convexHull(pts)
             cv2.fillConvexPoly(mask, hull, 255)
+            # Dilate mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
+            mask = cv2.dilate(mask, kernel, iterations=1)
+            mask_pil = Image.fromarray(mask)
 
-    # Dilate mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (30, 30))
-    mask = cv2.dilate(mask, kernel, iterations=1)
+            hand_prompt = f"natural human hand, exactly five fingers, thumb index middle ring pinky, correct finger count, realistic hand anatomy, {body_prompt}"
+            try:
+                image = safe_inpaint(inpaint_pipe, image, mask_pil, hand_prompt,
+                                     strength=0.6, guidance=30, steps=50, seed=seed + i)
+            except Exception as e:
+                log(f"  [P2] Hand fix failed for hand {i}: {e}")
 
-    mask_pil = Image.fromarray(mask)
-    hand_prompt = f"{body_prompt}, detailed realistic hands, five fingers on each hand, correct finger count"
-
-    try:
-        generator = torch.Generator("cuda").manual_seed(seed + 100)
-        result = inpaint_pipe(
-            prompt=hand_prompt,
-            image=image,
-            mask_image=mask_pil,
-            control_image=image,
-            strength=0.55,
-            num_inference_steps=25,
-            guidance_scale=5.0,
-            generator=generator,
-        )
-        log(f"  [P2] Hands fixed ({len(results.multi_hand_landmarks)} hands)")
-        return result.images[0]
-    except Exception as e:
-        log(f"  [P2] Hand fix failed: {e}")
-        return image
+    log(f"  [P2] Hands fixed ({len(results.multi_hand_landmarks)} hands)")
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -776,50 +822,55 @@ def pass2_fix_hands(inpaint_pipe, image, body_prompt, seed):
 # ---------------------------------------------------------------------------
 
 def pass3_fix_body(inpaint_pipe, image, body_prompt, clothing_desc, seed):
-    """Fix body artifacts using SegFormer segmentation + inpainting."""
-    import cv2
-
+    """Fix feet, clothing edges, tan lines using SegFormer masks (v12b parity).
+    Three sub-fixes: feet, clothing, tan lines — each with safe_inpaint."""
     seg_map = segment_body(image)
+    fixes = []
+    t0 = time.time()
 
-    # Body = all person classes (skin + clothing)
-    body_mask = get_part_mask(seg_map, SEG_PERSON_IDS, dilate_px=4)
+    # Fix feet (shoes + lower legs = foot area)
+    foot_ids = SEGFORMER_CLASSES["feet"] + SEGFORMER_CLASSES["legs_lower"]
+    if has_part(seg_map, SEGFORMER_CLASSES["feet"], min_pixels=300):
+        mask = get_part_mask(seg_map, foot_ids, dilate_px=8)
+        if mask is not None:
+            prompt = f"natural human feet, exactly five toes per foot, correct toe anatomy, realistic foot structure, defined individual toes, {body_prompt}"
+            try:
+                image = safe_inpaint(inpaint_pipe, image, mask, prompt,
+                                     strength=0.5, guidance=30, steps=50, seed=seed + 200)
+                fixes.append("feet")
+            except Exception as e:
+                log(f"  [P3] Feet fix failed: {e}")
 
-    # Only fix if body is detected
-    body_pixels = np.sum(body_mask > 0)
-    if body_pixels < 5000:
-        log("  [P3] Body region too small, skipping")
-        return image
+    # Fix clothing edges
+    if has_part(seg_map, SEGFORMER_CLASSES["lower_clothing"], min_pixels=500):
+        mask = get_part_mask(seg_map, SEGFORMER_CLASSES["lower_clothing"], dilate_px=6)
+        if mask is not None:
+            prompt = f"clean {clothing_desc}, defined edges, sharp fabric detail, {body_prompt}"
+            try:
+                image = safe_inpaint(inpaint_pipe, image, mask, prompt,
+                                     strength=0.4, guidance=30, steps=50, seed=seed + 210)
+                fixes.append("clothing")
+            except Exception as e:
+                log(f"  [P3] Clothing fix failed: {e}")
 
-    # Create foot region mask (bottom 25% of body mask)
-    h, w = body_mask.shape
-    foot_region = np.zeros_like(body_mask)
-    foot_start = int(h * 0.75)
-    foot_region[foot_start:] = body_mask[foot_start:]
+    # Fix tan lines on exposed skin (legs + arms)
+    if has_part(seg_map, SEGFORMER_CLASSES["torso_skin"], min_pixels=1000):
+        mask = get_part_mask(seg_map, SEGFORMER_CLASSES["torso_skin"], dilate_px=4)
+        if mask is not None:
+            prompt = f"uniform olive tan skin, smooth natural skin, no tan lines, {body_prompt}"
+            try:
+                image = safe_inpaint(inpaint_pipe, image, mask, prompt,
+                                     strength=0.35, guidance=30, steps=50, seed=seed + 220)
+                fixes.append("tan_lines")
+            except Exception as e:
+                log(f"  [P3] Tan line fix failed: {e}")
 
-    if np.sum(foot_region > 0) < 1000:
-        log("  [P3] No feet region to fix, skipping")
-        return image
+    if fixes:
+        log(f"  [P3] Fixed: {', '.join(fixes)} in {time.time() - t0:.1f}s")
+    else:
+        log("  [P3] No body parts needed fixing, skipping")
 
-    mask_pil = Image.fromarray(foot_region)
-    fix_prompt = f"{body_prompt}, {clothing_desc}, realistic feet, correct toes"
-
-    try:
-        generator = torch.Generator("cuda").manual_seed(seed + 200)
-        result = inpaint_pipe(
-            prompt=fix_prompt,
-            image=image,
-            mask_image=mask_pil,
-            control_image=image,
-            strength=0.45,
-            num_inference_steps=25,
-            guidance_scale=5.0,
-            generator=generator,
-        )
-        log(f"  [P3] Feet/body fixed")
-        return result.images[0]
-    except Exception as e:
-        log(f"  [P3] Body fix failed: {e}")
-        return image
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -827,52 +878,123 @@ def pass3_fix_body(inpaint_pipe, image, body_prompt, clothing_desc, seed):
 # ---------------------------------------------------------------------------
 
 def pass3e_fix_chest(inpaint_pipe, image, body_prompt, seed, clothing_desc=""):
-    """Fix chest/nipple artifacts in topless photos."""
+    """Fix nipple/breast detail for topless photos (v12b parity).
+    Uses face position + SegFormer exclusion for precise chest masking.
+    strength=0.40, guidance=7.0, steps=50."""
     import cv2
 
-    seg_map = segment_body(image)
-    body_mask = get_part_mask(seg_map, SEG_PERSON_IDS, dilate_px=0)
-
-    h, w = body_mask.shape
-    # Chest region: roughly upper-middle body area
-    chest_region = np.zeros_like(body_mask)
-    chest_top = int(h * 0.25)
-    chest_bottom = int(h * 0.55)
-    chest_left = int(w * 0.2)
-    chest_right = int(w * 0.8)
-    chest_region[chest_top:chest_bottom, chest_left:chest_right] = body_mask[chest_top:chest_bottom, chest_left:chest_right]
-
-    if np.sum(chest_region > 0) < 2000:
-        log("  [P3e] No chest region detected, skipping")
+    # Check if topless using clothing description
+    clothing_lower = clothing_desc.lower().strip()
+    has_top = any(word in clothing_lower for word in [
+        "top", "shirt", "sweater", "bra", "dress", "knit", "blouse", "jacket",
+        "bodysuit", "mesh",
+    ])
+    if has_top:
+        log(f"  [P3e] Upper clothing in description ('{clothing_desc}') — skipping chest fix")
+        return image
+    topless_keywords = ("", "none visible", "none", "blue thong", "thong", "panties",
+                        "grey thong", "blue lace thong")
+    if clothing_lower not in topless_keywords:
+        log(f"  [P3e] Uncertain clothing ('{clothing_desc}') — skipping chest fix")
         return image
 
-    mask_pil = Image.fromarray(chest_region)
-    fix_prompt = f"{body_prompt}, natural chest, realistic skin texture, smooth skin"
+    seg_map = segment_body(image)
+    w, h = image.size
+
+    # Find face position to estimate chest region
+    face_pixels = np.where(seg_map == 11)  # 11 = Face in SegFormer
+    if len(face_pixels[0]) == 0:
+        log("  [P3e] No face detected — skipping chest fix")
+        return image
+
+    face_bottom = int(face_pixels[0].max())
+    face_cx = int(face_pixels[1].mean())
+
+    # Chest region: starts below face/neck gap, extends ~25% of image height
+    neck_gap = int(h * 0.05)
+    chest_top = min(face_bottom + neck_gap, h - 80)
+    chest_bottom = min(chest_top + int(h * 0.25), h - 40)
+    chest_left = max(face_cx - int(w * 0.30), 0)
+    chest_right = min(face_cx + int(w * 0.30), w)
+
+    if chest_bottom <= chest_top or chest_right <= chest_left:
+        log("  [P3e] Invalid chest region (face too low) — skipping")
+        return image
+
+    # Create base elliptical mask
+    mask_pil = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask_pil)
+    draw.ellipse([chest_left, chest_top, chest_right, chest_bottom], fill=255)
+    mask_arr = np.array(mask_pil)
+
+    # Exclude non-chest areas: face (11), arms (14, 15), hair (2), clothing (4, 5, 6, 7)
+    exclude_ids = [2, 4, 5, 6, 7, 11, 14, 15]
+    exclude_mask = np.isin(seg_map, exclude_ids).astype(np.uint8) * 255
+    excl_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (12, 12))
+    exclude_mask = cv2.dilate(exclude_mask, excl_kernel, iterations=1)
+    mask_arr = np.where(exclude_mask > 0, 0, mask_arr)
+
+    # Soft feathering
+    mask_pil = Image.fromarray(mask_arr)
+    mask_pil = mask_pil.filter(ImageFilter.GaussianBlur(10))
+
+    mask_pixels = np.array(mask_pil).sum() / 255
+    if mask_pixels < 800:
+        log(f"  [P3e] Chest mask too small ({mask_pixels:.0f}px) — skipping")
+        return image
+
+    log(f"  [P3e] Chest mask: {mask_pixels:.0f}px, region y={chest_top}-{chest_bottom}")
+
+    prompt = (
+        f"babe_model, babe_body, natural female chest with small natural breasts, "
+        f"realistic nipples and areola proportional to small A-cup breasts, "
+        f"smooth olive tan skin, warm natural lighting, anatomically correct, "
+        f"photorealistic, zishy_style"
+    )
 
     try:
-        generator = torch.Generator("cuda").manual_seed(seed + 300)
-        result = inpaint_pipe(
-            prompt=fix_prompt,
-            image=image,
-            mask_image=mask_pil,
-            control_image=image,
-            strength=0.35,
-            num_inference_steps=20,
-            guidance_scale=4.0,
-            generator=generator,
-        )
-        log(f"  [P3e] Chest fixed")
-        return result.images[0]
+        image = safe_inpaint(inpaint_pipe, image, mask_pil, prompt,
+                             strength=0.40, guidance=7.0, steps=50, seed=seed + 300)
+        log(f"  [P3e] Chest/nipple fixed")
     except Exception as e:
         log(f"  [P3e] Chest fix failed: {e}")
-        return image
+
+    return image
+
+
+# ---------------------------------------------------------------------------
+# Pass 3c: Watermark Removal (v12b parity)
+# ---------------------------------------------------------------------------
+
+def pass3c_fix_watermark(inpaint_pipe, image, seed):
+    """Remove Zishy watermark from OUTPUT using safe_inpaint.
+    The style LoRA regenerates the watermark even after input removal,
+    so we must also inpaint the output's bottom strip."""
+    w, h = image.size
+    mask = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(mask)
+    # Full bottom strip: 75px high, entire width
+    wm_h = 75
+    draw.rectangle([0, h - wm_h, w, h], fill=255)
+    # Feather the mask edges for smooth blending
+    mask = mask.filter(ImageFilter.GaussianBlur(8))
+
+    prompt = "natural background, clean photo corner, no text, no watermark, no logo"
+    t0 = time.time()
+    try:
+        image = safe_inpaint(inpaint_pipe, image, mask, prompt,
+                             strength=0.95, guidance=30, steps=30, seed=seed + 50)
+        log(f"  [P3c] Watermark inpainted in {time.time() - t0:.1f}s")
+    except Exception as e:
+        log(f"  [P3c] Watermark fix failed: {e}")
+    return image
 
 
 # ---------------------------------------------------------------------------
 # Pass 3d: Face Restoration (GFPGAN)
 # ---------------------------------------------------------------------------
 
-def pass3d_restore_face(image, weight=0.7):
+def pass3d_restore_face(image, weight=0.3):
     """Restore face using GFPGAN v1.4."""
     if gfpgan_restorer is None or gfpgan_restorer is False:
         log("  [P3d] GFPGAN not available, skipping")
@@ -1042,7 +1164,7 @@ def fg_skin_texture(arr, skin_mask, rng):
         synth = pore_bp * 0.6 + mid_bp * 0.4
         synth_std = float(np.std(synth))
         if synth_std > 0:
-            synth = synth * (deficit / synth_std) * 0.55
+            synth = synth * (deficit / synth_std) * 0.35
         tex_rgb = np.stack([synth * 1.05, synth * 0.95, synth * 0.88], axis=-1)
         midtone = np.clip(1.0 - np.abs(lum - 0.47) / 0.4, 0.3, 1.0)
         img = img + tex_rgb * (sm * midtone)[..., None]
@@ -1076,9 +1198,9 @@ def fg_skin_texture(arr, skin_mask, rng):
     perfusion = cv2.resize(perf_grid, (w, h), interpolation=cv2.INTER_CUBIC)
     perf2_grid = rng.normal(0, 1, ((h + 19) // 20, (w + 19) // 20)).astype(np.float32)
     perfusion2 = cv2.resize(perf2_grid, (w, h), interpolation=cv2.INTER_CUBIC)
-    color_shift = (perfusion * 0.6 + perfusion2 * 0.4) * 2.5
-    img[..., 0] += color_shift * sm * 1.3
-    img[..., 1] -= color_shift * sm * 0.4
+    color_shift = (perfusion * 0.6 + perfusion2 * 0.4) * 1.5
+    img[..., 0] += color_shift * sm * 1.1
+    img[..., 1] -= color_shift * sm * 0.3
 
     return np.clip(img, 0, 255)
 
@@ -1342,7 +1464,11 @@ def handler(job):
                 image = pass3e_fix_chest(inpaint_pipe_obj, image, body_description, seed, clothing_desc)
                 passes_run.append("chest")
 
-            # Pass 3d: Face restoration
+            # Pass 3c: Watermark removal (style LoRA regenerates Zishy watermark)
+            image = pass3c_fix_watermark(inpaint_pipe_obj, image, seed)
+            passes_run.append("watermark")
+
+            # Pass 3d: Face restoration (weight=0.3 = subtle, preserves LoRA identity)
             image = pass3d_restore_face(image)
             passes_run.append("face_restore")
 
@@ -1371,7 +1497,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v3.1-fixpasses",
+            "handler_version": "v4.0-v12b-parity",
             "skin_debug": _skin_mask_error,
         }
 
