@@ -114,6 +114,7 @@ HEIGHT_MAP = {
 img2img_pipe = None
 controlnet = None
 single_controlnet = None
+inpaint_controlnet = None  # Alimama inpainting ControlNet (preloaded lazily)
 segformer_model = None
 segformer_processor = None
 depth_pipe = None
@@ -1137,31 +1138,58 @@ def pass5_filmgrade(image, seed):
 # Inpainting Pipeline Management
 # ---------------------------------------------------------------------------
 
-def create_inpaint_pipe():
-    """Create Alimama inpainting pipeline (swaps ControlNet, reuses FLUX.1-dev)."""
-    from diffusers import FluxControlNetInpaintPipeline, FluxControlNetModel
+def load_inpaint_controlnet():
+    """Load Alimama inpainting ControlNet (lazily, kept in VRAM for reuse).
 
-    log("Loading Alimama Inpainting ControlNet...")
+    The Alimama model config has extra_condition_channels=4 and in_channels=64,
+    but diffusers 0.38+ ignores extra_condition_channels, so we override
+    in_channels to 68 (64 latent + 4 mask channels) to match the weights.
+    """
+    global inpaint_controlnet
+    if inpaint_controlnet is not None:
+        return
+
+    from diffusers import FluxControlNetModel
+
+    log("Loading Alimama Inpainting ControlNet (in_channels=68)...")
     t0 = time.time()
 
-    inpaint_cn = FluxControlNetModel.from_pretrained(
+    inpaint_controlnet = FluxControlNetModel.from_pretrained(
         "alimama-creative/FLUX.1-dev-Controlnet-Inpainting-Beta",
         torch_dtype=torch.bfloat16,
+        in_channels=68,  # 64 latent + 4 mask (config.extra_condition_channels=4)
         cache_dir=MODEL_CACHE,
     ).to("cuda")
 
-    inpaint_pipe = FluxControlNetInpaintPipeline.from_pretrained(
-        "black-forest-labs/FLUX.1-dev",
-        controlnet=inpaint_cn,
-        torch_dtype=torch.bfloat16,
-        cache_dir=MODEL_CACHE,
-    )
-    inpaint_pipe.transformer.to("cuda")
-    inpaint_pipe.text_encoder.to("cuda")
-    inpaint_pipe.text_encoder_2.to("cuda")
-    inpaint_pipe.vae.to("cuda")
+    vram = torch.cuda.max_memory_allocated() / 1e9
+    log(f"Alimama ControlNet loaded in {time.time()-t0:.0f}s, VRAM: {vram:.1f}GB")
 
-    log(f"Inpaint pipe loaded in {time.time()-t0:.0f}s")
+
+def create_inpaint_pipe():
+    """Create inpainting pipeline sharing transformer/encoders with img2img pipe.
+
+    Shares all components (transformer, text encoders, VAE, tokenizers) so:
+    - No duplicate transformer in VRAM (~12GB saved)
+    - LoRAs are already loaded (no re-loading needed)
+    - Instant creation (no model download)
+    Only the Alimama ControlNet is separate (preloaded lazily, ~3.5GB).
+    """
+    from diffusers import FluxControlNetInpaintPipeline
+
+    load_inpaint_controlnet()
+
+    inpaint_pipe = FluxControlNetInpaintPipeline(
+        transformer=img2img_pipe.transformer,
+        text_encoder=img2img_pipe.text_encoder,
+        text_encoder_2=img2img_pipe.text_encoder_2,
+        vae=img2img_pipe.vae,
+        scheduler=img2img_pipe.scheduler,
+        tokenizer=img2img_pipe.tokenizer,
+        tokenizer_2=img2img_pipe.tokenizer_2,
+        controlnet=inpaint_controlnet,
+    )
+
+    log("Inpaint pipe created (shared transformer, LoRAs inherited)")
     return inpaint_pipe
 
 
@@ -1260,41 +1288,11 @@ def handler(job):
         if not skip_fix:
             # Need to swap to inpaint pipeline
             # Free img2img ControlNet VRAM
-            log("Swapping to inpaint pipeline for fix passes...")
+            log("Creating inpaint pipeline for fix passes (shared transformer)...")
 
-            # Temporarily unload main ControlNet to free VRAM
-            # (We keep the transformer/encoders shared via from_pretrained cache)
+            # Create inpaint pipeline sharing all components with img2img_pipe
+            # LoRAs are already on the shared transformer — no re-loading needed
             inpaint_pipe_obj = create_inpaint_pipe()
-
-            # Reload LoRAs into inpaint pipe (some may fail due to architecture mismatch)
-            inpaint_adapter_names = []
-            inpaint_adapter_weights = []
-            for i, config in enumerate(lora_configs):
-                url = config.get("url", "")
-                if not url:
-                    continue
-                try:
-                    local_path = download_lora(url)
-                    inpaint_pipe_obj.load_lora_weights(local_path, adapter_name=f"adapter_{i}")
-                    # Verify adapter was actually loaded
-                    present = set()
-                    for comp in [inpaint_pipe_obj.transformer, inpaint_pipe_obj.text_encoder, inpaint_pipe_obj.text_encoder_2]:
-                        if hasattr(comp, 'peft_config'):
-                            present.update(comp.peft_config.keys())
-                    if f"adapter_{i}" in present:
-                        inpaint_adapter_names.append(f"adapter_{i}")
-                        inpaint_adapter_weights.append(float(config.get("scale", 1.0)))
-                        log(f"  Inpaint LoRA adapter_{i} loaded OK")
-                    else:
-                        log(f"  Inpaint LoRA adapter_{i} loaded but not present (incompatible keys?), skipping")
-                except Exception as e:
-                    log(f"  Inpaint LoRA adapter_{i} failed (skipping): {e}")
-
-            if inpaint_adapter_names:
-                inpaint_pipe_obj.set_adapters(inpaint_adapter_names, adapter_weights=inpaint_adapter_weights)
-                log(f"  Inpaint adapters set: {inpaint_adapter_names}")
-            else:
-                log("  WARNING: No LoRAs loaded into inpaint pipe")
 
             load_fix_models()
 
@@ -1315,10 +1313,8 @@ def handler(job):
             image = pass3d_restore_face(image)
             passes_run.append("face_restore")
 
-            # Cleanup inpaint pipe
+            # Cleanup inpaint pipe wrapper (shared components stay alive via img2img_pipe)
             del inpaint_pipe_obj
-            gc.collect()
-            torch.cuda.empty_cache()
 
         # ── Pass 5: Filmgrade + Skin Texture ──
         skin_texture_applied = False
@@ -1342,7 +1338,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v3.0-ipadapter",
+            "handler_version": "v3.1-fixpasses",
             "skin_debug": _skin_mask_error,
         }
 
