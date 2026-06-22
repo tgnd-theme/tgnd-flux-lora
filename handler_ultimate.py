@@ -1416,7 +1416,7 @@ def handler(job):
                 "status": "ok",
                 "message": "healthy",
                 "vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1),
-                "handler_version": "v4.1-pulid",
+                "handler_version": "v4.2-pulid",
                 "pulid_available": pulid_ok,
                 "pulid_error": pulid_error,
             }
@@ -1491,35 +1491,43 @@ def handler(job):
         if face_ref_urls:
             try:
                 from pulid_flux import extract_face_embedding, patch_flux
-                import torch.nn.functional as F
 
                 load_pulid()
                 log(f"  Extracting face identity from {len(face_ref_urls)} reference(s)...")
 
-                embeddings = []
+                # Extract per-face embeddings (each returns (id_cond, id_vit_hidden) tuple)
+                face_results = []
                 for url in face_ref_urls[:3]:  # Max 3 face refs
                     face_img = download_image(url)
-                    emb = extract_face_embedding(face_img, device="cuda")
-                    if emb is not None:
-                        embeddings.append(emb)
+                    result = extract_face_embedding(face_img, device="cuda")
+                    if result is not None:
+                        face_results.append(result)
 
-                if embeddings:
-                    # Average embeddings from multiple refs for better identity
-                    id_cond = torch.mean(torch.stack(embeddings), dim=0)
+                if face_results:
+                    # Average id_cond and id_vit_hidden across multiple refs
+                    avg_id_cond = torch.mean(torch.stack([r[0] for r in face_results]), dim=0)
+                    # Average each hidden feature layer separately
+                    num_hidden = len(face_results[0][1])
+                    avg_id_vit_hidden = [
+                        torch.mean(torch.stack([r[1][i] for r in face_results]), dim=0)
+                        for i in range(num_hidden)
+                    ]
 
-                    # Run through IDFormer to get identity tokens
+                    # Run through IDFormer to get identity tokens [B, 32, 2048]
                     with torch.no_grad():
-                        id_tokens = pulid_module.id_former(id_cond)
+                        id_embedding = pulid_module.pulid_encoder(avg_id_cond, avg_id_vit_hidden)
+
+                    log(f"  PuLID id_embedding: {id_embedding.shape}")
 
                     # Monkey-patch transformer blocks with PuLID cross-attention
                     pulid_unpatch = patch_flux(
                         img2img_pipe.transformer,
                         pulid_module,
-                        id_tokens,
+                        id_embedding,
                         strength=pulid_strength,
                     )
                     passes_run.append("pulid_face")
-                    log(f"  PuLID active: {len(embeddings)} face(s), strength={pulid_strength}")
+                    log(f"  PuLID active: {len(face_results)} face(s), strength={pulid_strength}")
                 else:
                     log("  WARNING: No faces detected in reference images, skipping PuLID")
             except Exception as e:
@@ -1597,7 +1605,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v4.1-pulid",
+            "handler_version": "v4.2-pulid",
             "skin_debug": _skin_mask_error,
         }
 

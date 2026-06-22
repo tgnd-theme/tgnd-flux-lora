@@ -20,19 +20,39 @@ ENDPOINT_ID = "cgvk5tmqgtdm6h"
 RUNPOD_URL = f"https://api.runpod.ai/v2/{ENDPOINT_ID}"
 
 STAGING_BASE = "https://staging.the-girl-next-door.com/wp-content/uploads/tgnd-studio"
-LOOKBOOK_BASE = f"{STAGING_BASE}/lookbook/clean"
+LOOKBOOK_BASE = "https://huggingface.co/JulioIglesiass/tgnd-lookbook/resolve/main/clean"
 LORA_BASE = f"{STAGING_BASE}/loras"
+FACE_REF_BASE = "https://huggingface.co/JulioIglesiass/tgnd-loras/resolve/main/face_refs"
 
-# Triple LoRA config (v12b golden standard)
-# Body LoRA is BFL format — handler auto-converts to diffusers format
-LORAS = [
-    {"url": f"{LORA_BASE}/babe_face_v2_aitk.safetensors", "scale": 0.5, "trigger": "babe_model"},
-    {"url": f"{LORA_BASE}/babe_body_v2.safetensors", "scale": 0.45, "trigger": "babe_body"},
-    {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
-]
+# ─── Escort Profiles ───
+# Each escort has their own LoRAs, body description, and face refs for PuLID
+ESCORTS = {
+    "agatha": {
+        "loras": [
+            {"url": f"{LORA_BASE}/lora_11_agatha_model.safetensors", "scale": 0.4, "trigger": "agatha_model"},
+            {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
+        ],
+        "body_desc": "curvy Latina woman, olive tan skin, natural C-cup breasts, black hair, toned body",
+        "face_refs": [
+            f"{FACE_REF_BASE}/agatha/HSsI-agatha-duarte.jpeg",
+            f"{FACE_REF_BASE}/agatha/Scy4-agatha-duarte.jpeg",
+            f"{FACE_REF_BASE}/agatha/tTU2-agatha-duarte.jpeg",
+        ],
+        "pulid_strength": 0.8,
+    },
+    "babe": {
+        "loras": [
+            {"url": f"{LORA_BASE}/babe_face_v2_aitk.safetensors", "scale": 0.5, "trigger": "babe_model"},
+            {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
+        ],
+        "body_desc": "slim petite Latina woman, olive tan skin, small natural A-cup breasts, dark brown hair with caramel highlights, diamond stud earrings, toned flat stomach",
+        "face_refs": [],  # No face refs yet for babe
+        "pulid_strength": 0.8,
+    },
+}
 
-# Babe's body description
-BODY_DESC = "slim petite Latina woman, olive tan skin, small natural A-cup breasts, dark brown hair with caramel highlights, diamond stud earrings, toned flat stomach"
+# Default escort (can override via --escort flag)
+DEFAULT_ESCORT = "agatha"
 
 CATALOG_PATH = os.path.expanduser("~/Desktop/lookbook/catalog.json")
 OUTPUT_DIR = os.path.expanduser("~/Desktop/The Girl Next Door/zishy/clean")
@@ -43,7 +63,7 @@ HEADERS = {
 }
 
 
-def build_prompt(entry):
+def build_prompt(entry, escort_profile):
     """Build generation prompt from catalog entry."""
     desc = entry.get("description", "")
     category = entry.get("category", "")
@@ -51,10 +71,14 @@ def build_prompt(entry):
     mood = entry.get("mood", "warm")
     topless = entry.get("topless", False)
 
+    # LoRA triggers from escort profile
+    triggers = " ".join(l["trigger"] for l in escort_profile["loras"])
+    body_desc = escort_profile["body_desc"]
+
     # Base prompt with LoRA triggers
     parts = [
-        f"babe_model babe_body zishy_style",
-        f"a beautiful {BODY_DESC}",
+        triggers,
+        f"a beautiful {body_desc}",
     ]
 
     # Expression
@@ -97,7 +121,7 @@ def build_clothing_desc(entry):
     return mapping.get(clothing, clothing)
 
 
-def submit_job(entry, seed=None):
+def submit_job(entry, escort_profile, seed=None):
     """Submit a generation job to RunPod."""
     if seed is None:
         seed = random.randint(1, 2147483647)
@@ -105,16 +129,18 @@ def submit_job(entry, seed=None):
     payload = {
         "input": {
             "lookbook_image_url": f"{LOOKBOOK_BASE}/{entry['file']}",
-            "prompt": build_prompt(entry),
+            "prompt": build_prompt(entry, escort_profile),
             "clothing_prompt": "",
             "clothing_desc": build_clothing_desc(entry),
             "expression_hint": "smiling, playful",
-            "loras": LORAS,
-            "body_description": BODY_DESC,
+            "loras": escort_profile["loras"],
+            "body_description": escort_profile["body_desc"],
+            "face_reference_urls": escort_profile.get("face_refs", []),
+            "pulid_strength": escort_profile.get("pulid_strength", 0.8),
             "strength": 0.80,
             "guidance": 5.0,
             "seed": seed,
-            "skip_fix": True,  # Fix passes disabled (Alimama inpaint ControlNet shape mismatch)
+            "skip_fix": True,
             "no_filmgrade": False,
         }
     }
@@ -165,10 +191,26 @@ def save_image(b64_data, filename):
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Batch generate lookbook photos")
+    parser.add_argument("--escort", default=DEFAULT_ESCORT, choices=ESCORTS.keys(),
+                        help=f"Escort to generate for (default: {DEFAULT_ESCORT})")
+    parser.add_argument("--limit", type=int, default=0, help="Max photos to generate (0=all)")
+    args = parser.parse_args()
+
+    escort_profile = ESCORTS[args.escort]
+    escort_name = args.escort
+
     # Load catalog
     with open(CATALOG_PATH) as f:
         catalog = json.load(f)
 
+    if args.limit:
+        catalog = catalog[:args.limit]
+
+    print(f"Escort: {escort_name}")
+    print(f"LoRAs: {[l['trigger'] for l in escort_profile['loras']]}")
+    print(f"PuLID face refs: {len(escort_profile.get('face_refs', []))}")
     print(f"Loaded {len(catalog)} lookbook references")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Endpoint: {ENDPOINT_ID}")
@@ -223,7 +265,7 @@ def main():
                 results_summary.append({"file": entry["file"], "status": "skipped"})
                 continue
 
-            job_id, seed = submit_job(entry)
+            job_id, seed = submit_job(entry, escort_profile)
             jobs.append({"job_id": job_id, "entry": entry, "seed": seed, "out_name": out_name})
 
         # Poll all jobs in batch
