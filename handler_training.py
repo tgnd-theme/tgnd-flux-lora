@@ -230,7 +230,10 @@ def analyze_body_profile(data_dir, anthropic_key):
 
 
 def caption_all_images(data_dir, trigger_word, focus, anthropic_key):
-    """Generate .txt caption files for all images in the directory."""
+    """Generate .txt caption files for all images in the directory.
+    Uses parallel threads for speed (up to 5 concurrent Claude Vision calls)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     image_exts = {".jpg", ".jpeg", ".png", ".webp"}
     images = sorted([
         f for f in os.listdir(data_dir)
@@ -239,19 +242,28 @@ def caption_all_images(data_dir, trigger_word, focus, anthropic_key):
 
     print(f"[TGND-TRAIN] Captioning {len(images)} images (focus={focus})...", flush=True)
 
-    for i, img_name in enumerate(images):
+    # Filter out images that already have captions
+    to_caption = []
+    for img_name in images:
+        txt_path = os.path.splitext(os.path.join(data_dir, img_name))[0] + ".txt"
+        if os.path.exists(txt_path):
+            print(f"  {img_name}: existing caption, skipping", flush=True)
+        else:
+            to_caption.append(img_name)
+
+    def caption_one(img_name):
         img_path = os.path.join(data_dir, img_name)
         txt_path = os.path.splitext(img_path)[0] + ".txt"
-
-        # Skip if caption already exists (from ZIP)
-        if os.path.exists(txt_path):
-            print(f"  [{i+1}/{len(images)}] {img_name}: existing caption, skipping", flush=True)
-            continue
-
         caption = caption_image_claude(img_path, trigger_word, focus, anthropic_key)
         with open(txt_path, "w") as f:
             f.write(caption)
-        print(f"  [{i+1}/{len(images)}] {img_name}: {caption[:80]}...", flush=True)
+        return img_name, caption
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(caption_one, name): name for name in to_caption}
+        for future in as_completed(futures):
+            img_name, caption = future.result()
+            print(f"  {img_name}: {caption[:80]}...", flush=True)
 
     return len(images)
 
@@ -304,12 +316,12 @@ def write_training_config(trigger_word, steps, rank, lr, resolution, lora_type):
                     "resolution": [resolution, resolution],
                 }],
                 "train": {
-                    "batch_size": 1,
+                    "batch_size": 2,
                     "steps": steps,
                     "gradient_accumulation_steps": 1,
                     "train_unet": True,
                     "train_text_encoder": False,
-                    "gradient_checkpointing": True,
+                    "gradient_checkpointing": False,
                     "noise_scheduler": "flowmatch",
                     "timestep_type": "weighted",
                     "optimizer": "adamw8bit",
@@ -319,10 +331,8 @@ def write_training_config(trigger_word, steps, rank, lr, resolution, lora_type):
                 "model": {
                     "name_or_path": "black-forest-labs/FLUX.1-dev",
                     "is_flux": True,
-                    "quantize": True,
-                    "quantize_te": True,
-                    "qtype": "qfloat8",
-                    "low_vram": True,
+                    "quantize": False,
+                    "low_vram": False,
                 },
                 "sample": {
                     "sampler": "flowmatch",
