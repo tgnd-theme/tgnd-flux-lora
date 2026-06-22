@@ -30,6 +30,8 @@ Input schema:
     },
     "body_reference_url": str,      # Optional body ref photo (IP-Adapter conditioning)
     "ip_adapter_scale": float,      # IP-Adapter influence (default: 0.5)
+    "face_reference_urls": [str],   # Optional face ref photos for PuLID identity (1-3 URLs)
+    "pulid_strength": float,        # PuLID face identity strength (default: 0.8)
     "strength": float,              # default: 0.80
     "guidance": float,              # default: 5.0
     "seed": int,
@@ -126,6 +128,7 @@ gfpgan_restorer = None
 loaded_lora_hash = None  # hash of currently loaded LoRA config
 ip_adapter_helper = None  # Helper pipeline for IP-Adapter loading
 ip_adapter_loaded = False
+pulid_module = None  # PuLID face identity module
 
 
 def log(msg):
@@ -237,6 +240,36 @@ def load_dwpose():
     except Exception as e:
         log(f"DWPose not available: {e}")
         dwpose_detector = False
+
+
+def load_pulid():
+    """Load PuLID-FLUX face identity model (lazy, only on first face ref request)."""
+    global pulid_module
+    if pulid_module is not None:
+        return
+
+    from pulid_flux import load_pulid_model, load_face_models
+
+    pulid_cache = os.path.join(MODEL_CACHE, "pulid")
+    os.makedirs(pulid_cache, exist_ok=True)
+
+    weights_path = os.path.join(pulid_cache, "pulid_flux_v0.9.1.safetensors")
+    if not os.path.exists(weights_path):
+        log("Downloading PuLID-FLUX weights from HuggingFace...")
+        from huggingface_hub import hf_hub_download
+        hf_hub_download(
+            "guozinan/PuLID",
+            "pulid_flux_v0.9.1.safetensors",
+            local_dir=pulid_cache,
+            local_dir_use_symlinks=False,
+        )
+        log("PuLID-FLUX weights downloaded")
+
+    pulid_module = load_pulid_model(weights_path, device="cuda")
+
+    # Pre-load face analysis models
+    load_face_models(device="cuda")
+    log("PuLID-FLUX ready")
 
 
 def load_fix_models():
@@ -1404,6 +1437,10 @@ def handler(job):
         body_ref_url = inp.get("body_reference_url", "")
         ip_adapter_scale = float(inp.get("ip_adapter_scale", 0.5))
 
+        # PuLID face identity
+        face_ref_urls = inp.get("face_reference_urls", [])
+        pulid_strength = float(inp.get("pulid_strength", 0.8))
+
         # Build body description
         if not body_description:
             body_description = build_body_description(lora_configs, body_overrides)
@@ -1434,10 +1471,55 @@ def handler(job):
             except Exception as e:
                 log(f"  WARNING: IP-Adapter failed ({e}), proceeding without body conditioning")
 
+        # Prepare PuLID face identity (if face references provided)
+        pulid_unpatch = None
+        if face_ref_urls:
+            try:
+                from pulid_flux import extract_face_embedding, patch_flux
+                import torch.nn.functional as F
+
+                load_pulid()
+                log(f"  Extracting face identity from {len(face_ref_urls)} reference(s)...")
+
+                embeddings = []
+                for url in face_ref_urls[:3]:  # Max 3 face refs
+                    face_img = download_image(url)
+                    emb = extract_face_embedding(face_img, device="cuda")
+                    if emb is not None:
+                        embeddings.append(emb)
+
+                if embeddings:
+                    # Average embeddings from multiple refs for better identity
+                    id_cond = torch.mean(torch.stack(embeddings), dim=0)
+
+                    # Run through IDFormer to get identity tokens
+                    with torch.no_grad():
+                        id_tokens = pulid_module.id_former(id_cond)
+
+                    # Monkey-patch transformer blocks with PuLID cross-attention
+                    pulid_unpatch = patch_flux(
+                        img2img_pipe.transformer,
+                        pulid_module,
+                        id_tokens,
+                        strength=pulid_strength,
+                    )
+                    passes_run.append("pulid_face")
+                    log(f"  PuLID active: {len(embeddings)} face(s), strength={pulid_strength}")
+                else:
+                    log("  WARNING: No faces detected in reference images, skipping PuLID")
+            except Exception as e:
+                log(f"  WARNING: PuLID failed ({e}), proceeding without face identity")
+                traceback.print_exc()
+                pulid_unpatch = None
+
         # ── Pass 1: Base Generation ──
         image = pass1_generate(ref_image, full_prompt, strength, seed, guidance,
                                ip_adapter_embeds=ip_adapter_embeds)
         passes_run.append("base")
+
+        # Unpatch PuLID after base generation (must restore original forwards)
+        if pulid_unpatch is not None:
+            pulid_unpatch()
 
         # ── Fix Passes (2, 3, 3e, 3d) ──
         if not skip_fix:

@@ -27,7 +27,10 @@ RUN pip install --no-cache-dir \
     scipy \
     'mediapipe<0.10.15' \
     controlnet_aux \
-    facexlib
+    facexlib \
+    insightface \
+    onnxruntime-gpu \
+    open-clip-torch
 
 # Install basicsr and gfpgan with torchvision compat fix
 # basicsr uses deprecated torchvision.transforms.functional_tensor
@@ -44,11 +47,14 @@ from diffusers import FluxControlNetInpaintPipeline; \
 from diffusers import FluxPipeline; \
 import mediapipe; \
 from gfpgan import GFPGANer; \
-print('Flux 1 + ControlNet + Inpaint + MediaPipe + GFPGAN imports OK')"
+import insightface; \
+import open_clip; \
+print('Flux 1 + ControlNet + Inpaint + MediaPipe + GFPGAN + PuLID deps OK')"
 
 # Copy handler + utilities
 COPY handler_ultimate.py /app/handler.py
 COPY filmgrade.py /app/filmgrade.py
+COPY pulid_flux.py /app/pulid_flux.py
 
 # RunPod serverless entry
 CMD ["python3", "-u", "/app/handler.py"]

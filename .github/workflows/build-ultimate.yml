@@ -7,6 +7,7 @@ on:
       - 'handler_ultimate.py'
       - 'Dockerfile.ultimate'
       - 'filmgrade.py'
+      - 'pulid_flux.py'
   workflow_dispatch:
 
 env:
