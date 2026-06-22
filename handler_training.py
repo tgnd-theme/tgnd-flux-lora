@@ -148,6 +148,87 @@ def caption_image_claude(image_path, trigger_word, focus, anthropic_key):
     return f"{trigger_word}, photo of a person"
 
 
+def analyze_body_profile(data_dir, anthropic_key):
+    """Analyze escort's body characteristics from training images using Claude Vision.
+    Returns dict with body_type, skin_tone, ref_cup, or empty dict on failure."""
+    if not anthropic_key:
+        return {}
+
+    image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+    images = sorted([
+        f for f in os.listdir(data_dir)
+        if os.path.splitext(f)[1].lower() in image_exts
+    ])
+
+    if not images:
+        return {}
+
+    # Pick up to 3 images for analysis (first, middle, last for variety)
+    sample_indices = [0]
+    if len(images) > 2:
+        sample_indices.append(len(images) // 2)
+    if len(images) > 1:
+        sample_indices.append(len(images) - 1)
+
+    image_contents = []
+    for idx in sample_indices:
+        img_path = os.path.join(data_dir, images[idx])
+        with open(img_path, "rb") as f:
+            img_data = base64.b64encode(f.read()).decode("utf-8")
+        ext = os.path.splitext(images[idx])[1].lower()
+        media_type = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+        image_contents.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": img_data},
+        })
+
+    prompt = (
+        "Analyze these photos of the SAME person. Determine their body characteristics. "
+        "Respond ONLY with JSON (no markdown, no explanation):\n\n"
+        '{"body_type": "<petite|slim|athletic|curvy|plus-size>", '
+        '"skin_tone": "<fair|light|medium|olive|tan|brown|dark>", '
+        '"ref_cup": "<A|B|C|D|DD+>", '
+        '"build": "<slim|athletic|curvy|plus_size>", '
+        '"hair_color": "<string>"}\n\n'
+        "Definitions: petite=small frame+short, slim=slender, athletic=toned, "
+        "curvy=fuller hips/bust, plus-size=larger frame."
+    )
+
+    image_contents.append({"type": "text", "text": prompt})
+
+    payload = {
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 200,
+        "messages": [{"role": "user", "content": image_contents}],
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            text = resp.json()["content"][0]["text"].strip()
+            # Strip markdown fences if present
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            profile = json.loads(text)
+            print(f"[TGND-TRAIN] Body analysis: {profile}", flush=True)
+            return profile
+        else:
+            print(f"[TGND-TRAIN] Body analysis API error {resp.status_code}", flush=True)
+    except Exception as e:
+        print(f"[TGND-TRAIN] Body analysis failed: {e}", flush=True)
+
+    return {}
+
+
 def caption_all_images(data_dir, trigger_word, focus, anthropic_key):
     """Generate .txt caption files for all images in the directory."""
     image_exts = {".jpg", ".jpeg", ".png", ".webp"}
@@ -419,7 +500,10 @@ def handler(job):
         if image_count == 0:
             raise Exception("No images found in ZIP")
 
-        # ── Step 2: Auto-caption with Claude Vision ──
+        # ── Step 2a: Analyze body profile with Claude Vision ──
+        body_profile = analyze_body_profile(TRAINING_DATA_DIR, anthropic_key)
+
+        # ── Step 2b: Auto-caption with Claude Vision ──
         caption_count = caption_all_images(
             TRAINING_DATA_DIR, trigger_word, caption_focus, anthropic_key
         )
@@ -446,7 +530,7 @@ def handler(job):
             cwd=AI_TOOLKIT_DIR,
             capture_output=True,
             text=True,
-            timeout=7200,  # 2 hour max
+            timeout=14400,  # 4 hour max
         )
 
         elapsed = time.time() - start_time
@@ -486,6 +570,7 @@ def handler(job):
             "storage_key": storage_key,
             "training_time_min": round(elapsed / 60, 1),
             "image_count": image_count,
+            "body_profile": body_profile,
         }
         print(f"[TGND-TRAIN] SUCCESS: {json.dumps(output)}", flush=True)
         return output
