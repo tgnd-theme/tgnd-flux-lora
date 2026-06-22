@@ -267,15 +267,48 @@ def write_training_config(trigger_word, steps, rank, lr, resolution, lora_type):
 
 
 # ---------------------------------------------------------------------------
-# Upload LoRA to WordPress
+# Upload LoRA — HuggingFace (primary) + WordPress (fallback)
 # ---------------------------------------------------------------------------
+HF_REPO_ID = "JulioIglesiass/tgnd-loras"
+
+
+def upload_lora_to_huggingface(safetensors_path, lora_id, trigger_word, hf_token):
+    """Upload .safetensors to HuggingFace and return the download URL."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    filename = f"lora_{lora_id}_{trigger_word}.safetensors"
+    size_mb = os.path.getsize(safetensors_path) / (1024 * 1024)
+
+    print(f"[TGND-TRAIN] Uploading {filename} ({size_mb:.1f} MB) to HuggingFace...", flush=True)
+
+    # Ensure repo exists
+    try:
+        api.create_repo(HF_REPO_ID, repo_type="model", private=True, token=hf_token, exist_ok=True)
+    except Exception as e:
+        print(f"[TGND-TRAIN] HF repo create: {e}", flush=True)
+
+    api.upload_file(
+        path_or_fileobj=safetensors_path,
+        path_in_repo=filename,
+        repo_id=HF_REPO_ID,
+        repo_type="model",
+        token=hf_token,
+    )
+
+    # Construct direct download URL
+    storage_key = f"https://huggingface.co/{HF_REPO_ID}/resolve/main/{filename}"
+    print(f"[TGND-TRAIN] HuggingFace upload OK: {storage_key}", flush=True)
+    return storage_key
+
+
 def upload_lora_to_wordpress(safetensors_path, lora_id, callback_url, webhook_secret):
-    """Upload the trained .safetensors file to WordPress via REST API."""
+    """Fallback: upload .safetensors to WordPress via REST API."""
     upload_url = callback_url.replace("/webhook", "/upload-lora")
 
     filename = os.path.basename(safetensors_path)
     file_size = os.path.getsize(safetensors_path) / (1024 * 1024)
-    print(f"[TGND-TRAIN] Uploading {filename} ({file_size:.1f} MB) to {upload_url}", flush=True)
+    print(f"[TGND-TRAIN] WP fallback: uploading {filename} ({file_size:.1f} MB) to {upload_url}", flush=True)
 
     with open(safetensors_path, "rb") as f:
         resp = requests.post(
@@ -285,16 +318,16 @@ def upload_lora_to_wordpress(safetensors_path, lora_id, callback_url, webhook_se
                 "lora_id": str(lora_id),
                 "secret": webhook_secret,
             },
-            timeout=300,
+            timeout=600,
         )
 
     if resp.status_code == 200:
         data = resp.json()
         storage_key = data.get("storage_key", "")
-        print(f"[TGND-TRAIN] Upload OK: {storage_key}", flush=True)
+        print(f"[TGND-TRAIN] WP upload OK: {storage_key}", flush=True)
         return storage_key
     else:
-        raise Exception(f"Upload failed ({resp.status_code}): {resp.text[:500]}")
+        raise Exception(f"WP upload failed ({resp.status_code}): {resp.text[:500]}")
 
 
 def send_callback(callback_url, lora_id, status, storage_key, webhook_secret, error=None):
@@ -432,12 +465,19 @@ def handler(job):
         size_mb = os.path.getsize(latest) / (1024 * 1024)
         print(f"[TGND-TRAIN] LoRA file: {latest} ({size_mb:.1f} MB)", flush=True)
 
-        # ── Step 7: Upload to WordPress ──
+        # ── Step 7: Upload LoRA (HuggingFace primary, WP fallback) ──
         storage_key = ""
-        if callback_url:
+        if hf_token:
+            try:
+                storage_key = upload_lora_to_huggingface(latest, lora_id, trigger_word, hf_token)
+            except Exception as e:
+                print(f"[TGND-TRAIN] HF upload failed, trying WP: {e}", flush=True)
+
+        if not storage_key and callback_url:
             storage_key = upload_lora_to_wordpress(latest, lora_id, callback_url, webhook_secret)
 
-            # Send success callback
+        # Send success callback to WordPress
+        if callback_url:
             send_callback(callback_url, lora_id, "ready", storage_key, webhook_secret)
 
         output = {
