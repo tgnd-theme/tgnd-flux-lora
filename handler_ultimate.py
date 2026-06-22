@@ -1404,7 +1404,22 @@ def handler(job):
         # Health check
         if inp.get("health_check"):
             load_base_models()
-            return {"status": "ok", "message": "healthy", "vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1)}
+            # Test PuLID imports
+            pulid_ok = False
+            pulid_error = ""
+            try:
+                from pulid_flux import load_pulid_model, load_face_models, extract_face_embedding, patch_flux
+                pulid_ok = True
+            except Exception as e:
+                pulid_error = str(e)
+            return {
+                "status": "ok",
+                "message": "healthy",
+                "vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1),
+                "handler_version": "v4.1-pulid",
+                "pulid_available": pulid_ok,
+                "pulid_error": pulid_error,
+            }
 
         lookbook_url = inp.get("lookbook_image_url", "")
         if not lookbook_url:
@@ -1508,8 +1523,11 @@ def handler(job):
                 else:
                     log("  WARNING: No faces detected in reference images, skipping PuLID")
             except Exception as e:
+                import traceback as tb
+                error_detail = tb.format_exc()
                 log(f"  WARNING: PuLID failed ({e}), proceeding without face identity")
-                traceback.print_exc()
+                log(f"  PuLID traceback:\n{error_detail}")
+                passes_run.append(f"pulid_FAILED:{str(e)[:100]}")
                 pulid_unpatch = None
 
         # ── Pass 1: Base Generation ──
@@ -1579,7 +1597,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v4.0-v12b-parity",
+            "handler_version": "v4.1-pulid",
             "skin_debug": _skin_mask_error,
         }
 
