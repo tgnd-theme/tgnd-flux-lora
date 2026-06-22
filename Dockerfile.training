@@ -1,0 +1,45 @@
+FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+
+WORKDIR /app
+
+# Upgrade torch (base has 2.4, need >=2.5 for ai-toolkit compatibility)
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    runpod \
+    requests \
+    Pillow \
+    pyyaml \
+    huggingface_hub \
+    safetensors \
+    'transformers>=4.50.0,<4.52.0' \
+    accelerate \
+    sentencepiece \
+    protobuf \
+    peft \
+    bitsandbytes \
+    'diffusers>=0.38.0' \
+    prodigyopt \
+    lycoris_lora \
+    torchmetrics \
+    wandb
+
+# Clone ai-toolkit
+RUN git clone https://github.com/ostris/ai-toolkit.git /app/ai-toolkit && \
+    cd /app/ai-toolkit && \
+    git submodule update --init --recursive && \
+    pip install --no-cache-dir -r requirements.txt
+
+# Set PYTHONPATH so ai-toolkit modules are importable
+ENV PYTHONPATH="/app/ai-toolkit:${PYTHONPATH}"
+
+# Verify ai-toolkit import works
+RUN cd /app/ai-toolkit && python3 -c "from toolkit.job import get_job; print('ai-toolkit OK')"
+
+# Copy handler
+COPY handler_training.py /app/handler.py
+
+# RunPod serverless entry
+CMD ["python3", "-u", "/app/handler.py"]
