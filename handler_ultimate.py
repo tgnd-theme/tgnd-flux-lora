@@ -1496,6 +1496,7 @@ def handler(job):
         seed = int(inp.get("seed", random.randint(1, 2147483647)))
         skip_fix = bool(inp.get("skip_fix", False))
         no_filmgrade = bool(inp.get("no_filmgrade", False))
+        skip_ip_adapter = bool(inp.get("skip_ip_adapter", False))
 
         # IP-Adapter body conditioning
         body_ref_url = inp.get("body_reference_url", "")
@@ -1514,8 +1515,8 @@ def handler(job):
 
         log(f"Starting generation: seed={seed}, strength={strength}, guidance={guidance}")
         log(f"  Prompt: {full_prompt[:120]}...")
-        log(f"  Fix passes: {'OFF' if skip_fix else 'ON'}, Filmgrade: {'OFF' if no_filmgrade else 'ON'}")
-        if body_ref_url:
+        log(f"  Fix passes: {'OFF' if skip_fix else 'ON'}, Filmgrade: {'OFF' if no_filmgrade else 'ON'}, IP-Adapter: {'OFF' if skip_ip_adapter else 'ON'}")
+        if body_ref_url and not skip_ip_adapter:
             log(f"  IP-Adapter body ref: {body_ref_url[:60]}... (scale={ip_adapter_scale})")
 
         total_t0 = time.time()
@@ -1525,25 +1526,28 @@ def handler(job):
         ref_image = download_image(lookbook_url)
         ref_image = remove_watermark(ref_image)
 
-        # Prepare IP-Adapter body conditioning
+        # Prepare IP-Adapter body conditioning (skip if disabled)
         ip_adapter_embeds = None
-        if body_ref_url:
-            try:
-                body_ref_image = download_image(body_ref_url)
-                ip_adapter_embeds = prepare_body_ip_embeddings(body_ref_image, ip_adapter_scale)
-                passes_run.append("ip_adapter_body")
-            except Exception as e:
-                log(f"  WARNING: IP-Adapter body ref failed ({e}), trying lookbook fallback")
-                body_ref_url = None  # Fall through to lookbook fallback
+        if not skip_ip_adapter:
+            if body_ref_url:
+                try:
+                    body_ref_image = download_image(body_ref_url)
+                    ip_adapter_embeds = prepare_body_ip_embeddings(body_ref_image, ip_adapter_scale)
+                    passes_run.append("ip_adapter_body")
+                except Exception as e:
+                    log(f"  WARNING: IP-Adapter body ref failed ({e}), trying lookbook fallback")
+                    body_ref_url = None  # Fall through to lookbook fallback
 
-        if not body_ref_url and not ip_adapter_embeds:
-            # Fallback: use lookbook reference itself as body ref (with face cropped)
-            try:
-                log(f"  [IPA] No body ref provided, using lookbook ref as body fallback")
-                ip_adapter_embeds = prepare_body_ip_embeddings(ref_image, ip_adapter_scale)
-                passes_run.append("ip_adapter_lookbook_body")
-            except Exception as e:
-                log(f"  WARNING: IP-Adapter lookbook fallback failed ({e}), proceeding without body conditioning")
+            if not body_ref_url and not ip_adapter_embeds:
+                # Fallback: use lookbook reference itself as body ref (with face cropped)
+                try:
+                    log(f"  [IPA] No body ref provided, using lookbook ref as body fallback")
+                    ip_adapter_embeds = prepare_body_ip_embeddings(ref_image, ip_adapter_scale)
+                    passes_run.append("ip_adapter_lookbook_body")
+                except Exception as e:
+                    log(f"  WARNING: IP-Adapter lookbook fallback failed ({e}), proceeding without body conditioning")
+        else:
+            log(f"  [IPA] IP-Adapter disabled (skip_ip_adapter=True)")
 
         # Prepare PuLID face identity (if face references provided)
         pulid_unpatch = None
