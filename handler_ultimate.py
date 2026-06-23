@@ -397,17 +397,66 @@ def blur_face_in_body_ref(image):
     return Image.fromarray(result.astype(np.uint8))
 
 
+def crop_body_from_ref(image):
+    """Crop body region below face from reference image.
+
+    CivitAI #1694024 approach: crop instead of blur for cleaner IP-Adapter signal.
+    Uses SegFormer to detect face region, then crops from bottom of face downward.
+
+    Fallbacks:
+    - No face detected → crop bottom 70% of image
+    - Crop too small (< 200px) → fall back to blur method
+    """
+    load_segformer()
+    seg_map = segment_body(image)
+
+    w, h = image.size
+
+    # Class 11 = Face, 2 = Hair
+    face_mask = np.zeros_like(seg_map, dtype=np.uint8)
+    for cid in [2, 11]:
+        face_mask[seg_map == cid] = 255
+
+    if face_mask.sum() < 100:
+        # No face detected — crop bottom 70%
+        crop_top = int(h * 0.3)
+        cropped = image.crop((0, crop_top, w, h))
+        log(f"  [IPA] No face detected, using bottom 70% crop ({cropped.size[1]}px)")
+        if cropped.size[1] < 200:
+            log(f"  [IPA] Crop too small, falling back to blur")
+            return blur_face_in_body_ref(image)
+        return cropped
+
+    # Find bottom of face+hair region
+    face_rows = np.where(face_mask.max(axis=1) > 0)[0]
+    face_bottom = face_rows[-1]
+
+    # Add 5% margin below face bottom
+    margin = int(h * 0.05)
+    crop_top = min(face_bottom + margin, h - 200)
+
+    cropped = image.crop((0, crop_top, w, h))
+    crop_pct = (h - crop_top) / h * 100
+    log(f"  [IPA] Body cropped below face (top {crop_top}px removed, {crop_pct:.0f}% kept)")
+
+    if cropped.size[1] < 200:
+        log(f"  [IPA] Crop too small ({cropped.size[1]}px), falling back to blur")
+        return blur_face_in_body_ref(image)
+
+    return cropped
+
+
 def prepare_body_ip_embeddings(body_ref_image, scale=0.5):
     """Encode body reference image for IP-Adapter conditioning.
 
-    1. Blur face region to isolate body features
+    1. Crop body below face (CivitAI approach) or blur as fallback
     2. Set IP-Adapter scale
     3. Encode image into embeddings via CLIP-ViT-L
     """
     load_ip_adapter_model()
 
-    # Blur face so IP-Adapter only captures body features
-    body_ref_processed = blur_face_in_body_ref(body_ref_image)
+    # Crop body below face for cleaner IP-Adapter signal
+    body_ref_processed = crop_body_from_ref(body_ref_image)
 
     # Set scale for this request
     ip_adapter_helper.set_ip_adapter_scale(scale)
@@ -1416,7 +1465,7 @@ def handler(job):
                 "status": "ok",
                 "message": "healthy",
                 "vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1),
-                "handler_version": "v4.2-pulid",
+                "handler_version": "v4.3-bodycrop",
                 "pulid_available": pulid_ok,
                 "pulid_error": pulid_error,
             }
@@ -1476,7 +1525,7 @@ def handler(job):
         ref_image = download_image(lookbook_url)
         ref_image = remove_watermark(ref_image)
 
-        # Prepare IP-Adapter body conditioning (if body reference provided)
+        # Prepare IP-Adapter body conditioning
         ip_adapter_embeds = None
         if body_ref_url:
             try:
@@ -1484,7 +1533,17 @@ def handler(job):
                 ip_adapter_embeds = prepare_body_ip_embeddings(body_ref_image, ip_adapter_scale)
                 passes_run.append("ip_adapter_body")
             except Exception as e:
-                log(f"  WARNING: IP-Adapter failed ({e}), proceeding without body conditioning")
+                log(f"  WARNING: IP-Adapter body ref failed ({e}), trying lookbook fallback")
+                body_ref_url = None  # Fall through to lookbook fallback
+
+        if not body_ref_url and not ip_adapter_embeds:
+            # Fallback: use lookbook reference itself as body ref (with face cropped)
+            try:
+                log(f"  [IPA] No body ref provided, using lookbook ref as body fallback")
+                ip_adapter_embeds = prepare_body_ip_embeddings(ref_image, ip_adapter_scale)
+                passes_run.append("ip_adapter_lookbook_body")
+            except Exception as e:
+                log(f"  WARNING: IP-Adapter lookbook fallback failed ({e}), proceeding without body conditioning")
 
         # Prepare PuLID face identity (if face references provided)
         pulid_unpatch = None
@@ -1605,7 +1664,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
-            "handler_version": "v4.2-pulid",
+            "handler_version": "v4.3-bodycrop",
             "skin_debug": _skin_mask_error,
         }
 

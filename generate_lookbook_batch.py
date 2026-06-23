@@ -23,16 +23,18 @@ STAGING_BASE = "https://staging.the-girl-next-door.com/wp-content/uploads/tgnd-s
 LOOKBOOK_BASE = "https://huggingface.co/JulioIglesiass/tgnd-lookbook/resolve/main/clean"
 LORA_BASE = f"{STAGING_BASE}/loras"
 FACE_REF_BASE = "https://huggingface.co/JulioIglesiass/tgnd-loras/resolve/main/face_refs"
+BODY_REF_BASE = f"{STAGING_BASE}/body_refs"
 
 # ─── Escort Profiles ───
 # Each escort has their own LoRAs, body description, and face refs for PuLID
 ESCORTS = {
     "agatha": {
         "loras": [
-            {"url": f"{LORA_BASE}/lora_11_agatha_model.safetensors", "scale": 0.4, "trigger": "agatha_model"},
+            {"url": "https://huggingface.co/JulioIglesiass/tgnd-loras/resolve/main/lora_11_agatha_model.safetensors", "scale": 0.65, "trigger": "agatha_model"},
             {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
         ],
         "body_desc": "curvy Latina woman, olive tan skin, natural C-cup breasts, black hair, toned body",
+        "body_ref": f"{BODY_REF_BASE}/agatha_body_ref.jpg",
         "face_refs": [
             f"{FACE_REF_BASE}/agatha/HSsI-agatha-duarte.jpeg",
             f"{FACE_REF_BASE}/agatha/Scy4-agatha-duarte.jpeg",
@@ -46,6 +48,7 @@ ESCORTS = {
             {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
         ],
         "body_desc": "slim petite Latina woman, olive tan skin, small natural A-cup breasts, dark brown hair with caramel highlights, diamond stud earrings, toned flat stomach",
+        "body_ref": f"{BODY_REF_BASE}/babe_body_ref.jpg",
         "face_refs": [],  # No face refs yet for babe
         "pulid_strength": 0.8,
     },
@@ -135,6 +138,7 @@ def submit_job(entry, escort_profile, seed=None):
             "expression_hint": "smiling, playful",
             "loras": escort_profile["loras"],
             "body_description": escort_profile["body_desc"],
+            "body_reference_url": escort_profile.get("body_ref", ""),
             "face_reference_urls": escort_profile.get("face_refs", []),
             "pulid_strength": escort_profile.get("pulid_strength", 0.8),
             "strength": 0.80,
@@ -210,6 +214,7 @@ def main():
 
     print(f"Escort: {escort_name}")
     print(f"LoRAs: {[l['trigger'] for l in escort_profile['loras']]}")
+    print(f"Body ref: {escort_profile.get('body_ref', 'none (lookbook fallback)')}")
     print(f"PuLID face refs: {len(escort_profile.get('face_refs', []))}")
     print(f"Loaded {len(catalog)} lookbook references")
     print(f"Output: {OUTPUT_DIR}")
