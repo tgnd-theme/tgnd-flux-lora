@@ -19,36 +19,33 @@ RUNPOD_API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 ENDPOINT_ID = "cgvk5tmqgtdm6h"
 RUNPOD_URL = f"https://api.runpod.ai/v2/{ENDPOINT_ID}"
 
-STAGING_BASE = "https://staging.the-girl-next-door.com/wp-content/uploads/tgnd-studio"
+HF_LORAS = "https://huggingface.co/JulioIglesiass/tgnd-loras/resolve/main"
 LOOKBOOK_BASE = "https://huggingface.co/JulioIglesiass/tgnd-lookbook/resolve/main/clean"
-LORA_BASE = f"{STAGING_BASE}/loras"
-FACE_REF_BASE = "https://huggingface.co/JulioIglesiass/tgnd-loras/resolve/main/face_refs"
-BODY_REF_BASE = f"{STAGING_BASE}/body_refs"
 
 # ─── Escort Profiles ───
 # Each escort has their own LoRAs, body description, and face refs for PuLID
 ESCORTS = {
     "agatha": {
         "loras": [
-            {"url": "https://huggingface.co/JulioIglesiass/tgnd-loras/resolve/main/lora_11_agatha_model.safetensors", "scale": 0.65, "trigger": "agatha_model"},
-            {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
+            {"url": f"{HF_LORAS}/lora_11_agatha_model.safetensors", "scale": 0.65, "trigger": "agatha_model"},
+            {"url": f"{HF_LORAS}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
         ],
         "body_desc": "curvy Latina woman, olive tan skin, natural C-cup breasts, black hair, toned body",
-        "body_ref": f"{BODY_REF_BASE}/agatha_body_ref.jpg",
+        "body_ref": f"{HF_LORAS}/body_refs/agatha_body_ref.jpg",
         "face_refs": [
-            f"{FACE_REF_BASE}/agatha/HSsI-agatha-duarte.jpeg",
-            f"{FACE_REF_BASE}/agatha/Scy4-agatha-duarte.jpeg",
-            f"{FACE_REF_BASE}/agatha/tTU2-agatha-duarte.jpeg",
+            f"{HF_LORAS}/face_refs/agatha/HSsI-agatha-duarte.jpeg",
+            f"{HF_LORAS}/face_refs/agatha/Scy4-agatha-duarte.jpeg",
+            f"{HF_LORAS}/face_refs/agatha/tTU2-agatha-duarte.jpeg",
         ],
         "pulid_strength": 0.8,
     },
     "babe": {
         "loras": [
-            {"url": f"{LORA_BASE}/babe_face_v2_aitk.safetensors", "scale": 0.5, "trigger": "babe_model"},
-            {"url": f"{LORA_BASE}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
+            {"url": f"{HF_LORAS}/babe_face_v2_aitk.safetensors", "scale": 0.5, "trigger": "babe_model"},
+            {"url": f"{HF_LORAS}/zishy_style_aitk.safetensors", "scale": 0.5, "trigger": "zishy_style"},
         ],
         "body_desc": "slim petite Latina woman, olive tan skin, small natural A-cup breasts, dark brown hair with caramel highlights, diamond stud earrings, toned flat stomach",
-        "body_ref": f"{BODY_REF_BASE}/babe_body_ref.jpg",
+        "body_ref": f"{HF_LORAS}/body_refs/babe_body_ref.jpg",
         "face_refs": [],  # No face refs yet for babe
         "pulid_strength": 0.8,
     },
