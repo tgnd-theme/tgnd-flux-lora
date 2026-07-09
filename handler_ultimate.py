@@ -1058,13 +1058,44 @@ def pass3e_fix_chest(inpaint_pipe, image, body_prompt, seed, clothing_desc=""):
 def pass3c_fix_watermark(inpaint_pipe, image, seed):
     """Remove Zishy watermark from OUTPUT using safe_inpaint.
     The style LoRA regenerates the watermark even after input removal,
-    so we must also inpaint the output's bottom strip."""
+    so we must also inpaint the output's bottom strip.
+
+    9 jul quality fix: this used to blanket-inpaint the ENTIRE bottom 75px strip at strength=0.95
+    regardless of content — fine for portrait/upper-body crops (bottom strip = background), but for
+    full-body standing compositions where feet/hands/clothing reach the bottom of frame, this could
+    silently repaint real anatomy as "clean background". Now uses SegFormer to check how much of that
+    strip is actual person/clothing content before touching it: mostly background -> inpaint as before;
+    mostly subject -> skip (a watermark is rare under real subject content, it sits in empty corners);
+    a mix -> subtract the person/clothing pixels from the mask so only the background around the
+    subject gets regenerated."""
     w, h = image.size
+    wm_h = 75
     mask = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(mask)
-    # Full bottom strip: 75px high, entire width
-    wm_h = 75
     draw.rectangle([0, h - wm_h, w, h], fill=255)
+
+    try:
+        seg_map = segment_body(image)
+        person_mask_full = np.isin(seg_map, SEG_PERSON_IDS)
+        strip_person_pixels = int(person_mask_full[h - wm_h:h, :].sum())
+        strip_total_pixels = wm_h * w
+        person_fraction = strip_person_pixels / max(strip_total_pixels, 1)
+
+        if person_fraction > 0.15:
+            log(f"  [P3c] Bottom strip is {person_fraction:.0%} person/clothing — skipping to protect anatomy")
+            return image
+
+        if person_fraction > 0:
+            # Small amount of subject in the strip (e.g. a foot edge) — subtract it from the mask
+            # so we still clean the background but never repaint the subject itself.
+            person_mask_np = (person_mask_full.astype(np.uint8) * 255)
+            person_mask_img = Image.fromarray(person_mask_np).filter(ImageFilter.GaussianBlur(4))
+            mask_np = np.array(mask).astype(np.int32) - np.array(person_mask_img).astype(np.int32)
+            mask = Image.fromarray(np.clip(mask_np, 0, 255).astype(np.uint8))
+            log(f"  [P3c] Bottom strip is {person_fraction:.0%} person/clothing — excluded from mask")
+    except Exception as e:
+        log(f"  [P3c] Segmentation check failed, falling back to full-strip inpaint: {e}")
+
     # Feather the mask edges for smooth blending
     mask = mask.filter(ImageFilter.GaussianBlur(8))
 
@@ -1644,10 +1675,15 @@ def handler(job):
             image = pass3_fix_body(inpaint_pipe_obj, image, body_description, clothing_desc, seed)
             passes_run.append("feet")
 
-            # Pass 3e: Chest fix (for topless photos)
-            if "topless" in full_prompt.lower() or "nude" in full_prompt.lower():
-                image = pass3e_fix_chest(inpaint_pipe_obj, image, body_description, seed, clothing_desc)
-                passes_run.append("chest")
+            # Pass 3e: Chest fix (for topless photos).
+            # 9 jul quality fix: this used to be double-gated — an outer substring check on
+            # full_prompt ("topless"/"nude") AND the function's own, more careful clothing_desc-based
+            # check. If the exact words "topless"/"nude" weren't in the concatenated prompt text (e.g.
+            # a style description phrased differently), the pass was skipped even when clothing_desc
+            # clearly indicated a topless shot. The function already has the real, reliable check
+            # (has_top exclusion + topless_keywords whitelist) — just call it directly and let it decide.
+            image = pass3e_fix_chest(inpaint_pipe_obj, image, body_description, seed, clothing_desc)
+            passes_run.append("chest_checked")
 
             # Pass 3c: Watermark removal (style LoRA regenerates Zishy watermark)
             image = pass3c_fix_watermark(inpaint_pipe_obj, image, seed)
