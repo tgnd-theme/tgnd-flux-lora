@@ -8,6 +8,7 @@ on:
       - 'Dockerfile.ultimate'
       - 'filmgrade.py'
       - 'pulid_flux.py'
+      - 'watermark_utils.py'
   workflow_dispatch:
 
 env:

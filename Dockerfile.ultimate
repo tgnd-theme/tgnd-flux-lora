@@ -39,6 +39,13 @@ RUN pip install --no-cache-dir basicsr && \
     open(p,'w').write('from torchvision.transforms.functional import rgb_to_grayscale\n')" && \
     pip install --no-cache-dir gfpgan
 
+# Invisible watermark (Cabine42 forensic mark on delivered photos — see watermark_utils.py).
+# --no-deps: the package's setup.py lists opencv-python, but this image already has
+# opencv-python-headless (same cv2 module, different PyPI name) — installing with deps would try to
+# pull in the GUI-dependent opencv-python on top and conflict. torch/numpy/Pillow are already present.
+RUN pip install --no-cache-dir --no-deps invisible-watermark && \
+    pip install --no-cache-dir PyWavelets
+
 # Verify critical imports work at build time
 # DWposeDetector and GFPGANer loaded lazily at runtime
 RUN python3 -c "\
@@ -49,12 +56,14 @@ import mediapipe; \
 from gfpgan import GFPGANer; \
 import insightface; \
 import open_clip; \
-print('Flux 1 + ControlNet + Inpaint + MediaPipe + GFPGAN + PuLID deps OK')"
+from imwatermark import WatermarkEncoder, WatermarkDecoder; \
+print('Flux 1 + ControlNet + Inpaint + MediaPipe + GFPGAN + PuLID + watermark deps OK')"
 
 # Copy handler + utilities
 COPY handler_ultimate.py /app/handler.py
 COPY filmgrade.py /app/filmgrade.py
 COPY pulid_flux.py /app/pulid_flux.py
+COPY watermark_utils.py /app/watermark_utils.py
 
 # RunPod serverless entry
 CMD ["python3", "-u", "/app/handler.py"]

@@ -51,6 +51,13 @@ import time
 import traceback
 
 try:
+    from watermark_utils import embed_watermark, make_id_from_string, id_to_hex
+    WATERMARK_AVAILABLE = True
+except Exception as _wm_import_err:
+    WATERMARK_AVAILABLE = False
+    print(f"[TGND-ULT] WARNING: watermark_utils unavailable, skipping watermark step: {_wm_import_err}", flush=True)
+
+try:
     import runpod
     print(f"[TGND-ULT] runpod {runpod.__version__}", flush=True)
 except Exception as e:
@@ -1498,6 +1505,13 @@ def handler(job):
         no_filmgrade = bool(inp.get("no_filmgrade", False))
         skip_ip_adapter = bool(inp.get("skip_ip_adapter", False))
 
+        # Invisible watermark (Cabine42, 9 jul 2026 — see watermark_utils.py for honesty notes on
+        # what this does and doesn't protect against). Optional: caller passes a stable identifier
+        # (e.g. session/attachment id) so a delivered photo can later be traced back to its generation
+        # record. If not provided, no watermark is embedded — this must never silently fail generation.
+        watermark_source_id = inp.get("watermark_id", "")
+        skip_watermark = bool(inp.get("skip_watermark", False))
+
         # IP-Adapter body conditioning
         body_ref_url = inp.get("body_reference_url", "")
         ip_adapter_scale = float(inp.get("ip_adapter_scale", 0.5))
@@ -1654,6 +1668,19 @@ def handler(job):
             if skin_texture_applied:
                 passes_run.append("skin_texture")
 
+        # ── Invisible watermark (last, right before encode — must run on the final delivered
+        #    pixels, not an intermediate pass) ──
+        watermark_id_hex = None
+        if WATERMARK_AVAILABLE and watermark_source_id and not skip_watermark:
+            try:
+                wm_id_bytes = make_id_from_string(watermark_source_id)
+                image = embed_watermark(image, wm_id_bytes)
+                watermark_id_hex = id_to_hex(wm_id_bytes)
+                passes_run.append("watermark_embed")
+            except Exception as e:
+                # Never fail generation over the watermark step — log and continue undamaged.
+                log(f"  Watermark embed FAILED (non-fatal, photo still delivered): {e}")
+
         # Encode output
         buf = io.BytesIO()
         image.save(buf, format="JPEG", quality=92)
@@ -1668,6 +1695,7 @@ def handler(job):
             "seed": seed,
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
+            "watermark_id": watermark_id_hex,
             "handler_version": "v4.3-bodycrop",
             "skin_debug": _skin_mask_error,
         }
