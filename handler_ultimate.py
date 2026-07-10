@@ -979,8 +979,15 @@ def pass3_fix_body(inpaint_pipe, image, body_prompt, clothing_desc, seed):
             # every photo. body_prompt already carries her real skin_tone from her profile.
             prompt = f"uniform even skin tone, natural skin texture with visible pores, no tan lines, {body_prompt}"
             try:
+                # 10 jul, A/B test (Fable audit finding S1): this pass ran at guidance=30 while the
+                # ONLY other pass ever specifically hand-tuned for skin (the chest fix) uses 7.0 —
+                # an unexplained inconsistency, and this is the pass that touches skin on almost
+                # every generation (any visible arm/leg skin, S2). High embedded guidance is a
+                # known source of waxy/oversaturated output. Testing 7.0 here, matching the chest
+                # fix, with the SAME seed as an existing real generation (session 50) for a
+                # controlled before/after — not guessing blind. strength/steps unchanged.
                 image = safe_inpaint(inpaint_pipe, image, mask, prompt,
-                                     strength=0.35, guidance=30, steps=50, seed=seed + 220)
+                                     strength=0.35, guidance=7.0, steps=50, seed=seed + 220)
                 fixes.append("tan_lines")
             except Exception as e:
                 log(f"  [P3] Tan line fix failed: {e}")
