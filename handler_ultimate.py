@@ -946,7 +946,13 @@ def pass3_fix_body(inpaint_pipe, image, body_prompt, clothing_desc, seed):
     if has_part(seg_map, SEGFORMER_CLASSES["torso_skin"], min_pixels=1000):
         mask = get_part_mask(seg_map, SEGFORMER_CLASSES["torso_skin"], dilate_px=4)
         if mask is not None:
-            prompt = f"uniform olive tan skin, smooth natural skin, no tan lines, {body_prompt}"
+            # 10 jul: "smooth natural skin" directly fought the pass5 skin-texture post-process
+            # (4-layer SSS/pore/specular/perfusion) that runs later — the model reads "smooth" as
+            # a texture instruction, not just "even tone". Kept the actual intent (fix blotchy tan
+            # lines) but swapped the wording for language that asks for even TONE while explicitly
+            # keeping visible texture, matching the phrasing already proven in the base prompt's
+            # universal positive ("natural skin texture with visible pores").
+            prompt = f"uniform olive tan skin, natural skin texture with visible pores, even tone, no tan lines, {body_prompt}"
             try:
                 image = safe_inpaint(inpaint_pipe, image, mask, prompt,
                                      strength=0.35, guidance=30, steps=50, seed=seed + 220)
@@ -1034,11 +1040,14 @@ def pass3e_fix_chest(inpaint_pipe, image, body_prompt, seed, clothing_desc=""):
 
     log(f"  [P3e] Chest mask: {mask_pixels:.0f}px, region y={chest_top}-{chest_bottom}")
 
+    # 10 jul: same "smooth" wording issue as the tan-line fix above — asked the model for smooth
+    # skin texture in exactly the region a real photo needs the MOST natural-looking skin, right
+    # before pass5's skin-texture layer tries to add it back. Same fix: even tone, explicit pores.
     prompt = (
         f"babe_model, babe_body, natural female chest with small natural breasts, "
         f"realistic nipples and areola proportional to small A-cup breasts, "
-        f"smooth olive tan skin, warm natural lighting, anatomically correct, "
-        f"photorealistic, zishy_style"
+        f"olive tan skin with natural texture and visible pores, warm natural lighting, "
+        f"anatomically correct, photorealistic, zishy_style"
     )
 
     try:
