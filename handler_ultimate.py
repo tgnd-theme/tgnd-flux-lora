@@ -567,6 +567,15 @@ def load_loras_for_escort(lora_configs):
     except Exception:
         pass
 
+    # 10 jul (Fable audit): loaded_lora_hash used to only get SET on success, never cleared here —
+    # so if every adapter below failed to load (bad URL, network blip, incompatible keys), the old
+    # hash from the PREVIOUS request stayed valid. That request's config, if it ever recurred
+    # (very plausible on a warm worker cycling between a small set of real users), would then read
+    # as a false "cache hit" and skip loading entirely — generating with ZERO LoRAs (no face, no
+    # style) and still returning a normal-looking successful photo to a paying customer. Clearing
+    # it here means a failure can only ever look like "not yet loaded", never like "already loaded".
+    loaded_lora_hash = None
+
     t0 = time.time()
     adapter_names = []
     adapter_weights = []
@@ -579,10 +588,10 @@ def load_loras_for_escort(lora_configs):
         if not url:
             continue
 
-        local_path = download_lora(url)
         adapter_name = f"adapter_{i}"
 
         try:
+            local_path = download_lora(url)
             img2img_pipe.load_lora_weights(local_path, adapter_name=adapter_name)
             # Verify adapter was actually registered
             present = set()
@@ -596,6 +605,9 @@ def load_loras_for_escort(lora_configs):
             else:
                 log(f"  LoRA {adapter_name} ({trigger}) loaded but not present (incompatible keys?), skipping")
         except Exception as e:
+            # 10 jul: download_lora() used to run OUTSIDE this try, so a download failure (network
+            # error, bad URL) raised straight out of load_loras_for_escort() instead of being
+            # logged and handled like every other per-adapter failure here.
             log(f"  LoRA {adapter_name} ({trigger}) failed: {e}")
 
     if adapter_names:
@@ -603,6 +615,15 @@ def load_loras_for_escort(lora_configs):
         loaded_lora_hash = config_hash
         labels = ", ".join(f"{n}={w}" for n, w in zip(adapter_names, adapter_weights))
         log(f"LoRAs loaded (unfused) [{labels}] in {time.time()-t0:.1f}s")
+    else:
+        # 10 jul: failing loudly here is correct, not harsh — a generation with none of the
+        # requested LoRAs has no face identity and no style, which for a real customer means a
+        # wrong-identity photo, not a degraded-but-usable one. The old code let this fall through
+        # silently and return a normal "status: ok" response.
+        raise RuntimeError(
+            f"None of the {len(lora_configs)} requested LoRAs could be loaded — "
+            f"refusing to generate without identity/style conditioning."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -952,7 +973,11 @@ def pass3_fix_body(inpaint_pipe, image, body_prompt, clothing_desc, seed):
             # lines) but swapped the wording for language that asks for even TONE while explicitly
             # keeping visible texture, matching the phrasing already proven in the base prompt's
             # universal positive ("natural skin texture with visible pores").
-            prompt = f"uniform olive tan skin, natural skin texture with visible pores, even tone, no tan lines, {body_prompt}"
+            # 10 jul, second pass (Fable audit): also dropped the hardcoded "olive tan" — this pass
+            # runs on nearly every generation (any visible arm/leg skin), so a fair-skinned or
+            # dark-skinned escort was having her actual skin tone repainted toward olive-tan on
+            # every photo. body_prompt already carries her real skin_tone from her profile.
+            prompt = f"uniform even skin tone, natural skin texture with visible pores, no tan lines, {body_prompt}"
             try:
                 image = safe_inpaint(inpaint_pipe, image, mask, prompt,
                                      strength=0.35, guidance=30, steps=50, seed=seed + 220)
@@ -1012,9 +1037,13 @@ def pass3e_fix_chest(inpaint_pipe, image, body_prompt, seed, clothing_desc=""):
     chest_left = max(face_cx - int(w * 0.30), 0)
     chest_right = min(face_cx + int(w * 0.30), w)
 
-    if chest_bottom <= chest_top or chest_right <= chest_left:
-        log("  [P3e] Invalid chest region (face too low) — skipping")
-        return image
+    # 10 jul (Fable audit): the "face too low" case this checked for can't actually happen — with
+    # chest_top = min(face_bottom + neck_gap, h - 80) and chest_bottom = min(chest_top + 0.25h,
+    # h - 40), chest_bottom > chest_top always (verified across image sizes 64-2048px, including
+    # the real 768x1024 production size); same for chest_right > chest_left via face_cx ∈ [0, w).
+    # The real "something's off" case (e.g. a face detected right at the bottom edge) is already
+    # caught below by the mask_pixels < 800 check. Removed the dead condition, left this note so
+    # the next person reading this doesn't reintroduce it as a "fix" for a bug that isn't here.
 
     # Create base elliptical mask
     mask_pil = Image.new("L", (w, h), 0)
@@ -1040,13 +1069,19 @@ def pass3e_fix_chest(inpaint_pipe, image, body_prompt, seed, clothing_desc=""):
 
     log(f"  [P3e] Chest mask: {mask_pixels:.0f}px, region y={chest_top}-{chest_bottom}")
 
-    # 10 jul: same "smooth" wording issue as the tan-line fix above — asked the model for smooth
-    # skin texture in exactly the region a real photo needs the MOST natural-looking skin, right
-    # before pass5's skin-texture layer tries to add it back. Same fix: even tone, explicit pores.
+    # 10 jul, second bug found in the same investigation (Fable audit, read-only diagnosis then
+    # applied by hand): this prompt hardcoded "babe_model, babe_body" — a specific OTHER escort's
+    # face trigger plus a body-LoRA trigger token — and "small A-cup breasts, olive tan skin" no
+    # matter which real escort's photo this is. The function already RECEIVES body_prompt (the
+    # correct per-escort trigger + cup-size + skin-tone description built from her actual profile)
+    # but never used it. For any escort who isn't Babe, this pass repainted the chest region with
+    # the wrong identity trigger and a hardcoded A-cup/olive-tan body — fighting whatever real cup
+    # size/skin tone Pass 1 had just generated from her actual profile. Also removed the smooth-skin
+    # wording (same class of bug as the tan-line fix above).
     prompt = (
-        f"babe_model, babe_body, natural female chest with small natural breasts, "
-        f"realistic nipples and areola proportional to small A-cup breasts, "
-        f"olive tan skin with natural texture and visible pores, warm natural lighting, "
+        f"{body_prompt}, natural female chest, "
+        f"realistic nipples and areola proportional to her breast size, "
+        f"natural skin texture with visible pores, even tone, warm natural lighting, "
         f"anatomically correct, photorealistic, zishy_style"
     )
 
@@ -1494,6 +1529,14 @@ def remove_watermark(image, crop_px=40):
 
 def handler(job):
     """RunPod serverless handler — Ultimate multi-pass lookbook generation."""
+    # 10 jul (Fable audit): _skin_mask_error is a module-level global, only ever (re)set inside
+    # get_skin_mask(). If this request skips filmgrade entirely (no_filmgrade=True) or pass5 throws
+    # before reaching get_skin_mask(), the "skin_debug" field in this request's output silently
+    # reports whatever a PREVIOUS job on this warm worker left there — exactly the telemetry used
+    # to diagnose the "photos look too smooth" complaint that started this investigation. Reset it
+    # per-request so a stale value can never be mistaken for this job's real result.
+    global _skin_mask_error
+    _skin_mask_error = "not_reached"
     try:
         inp = job.get("input", {})
 
@@ -1656,13 +1699,23 @@ def handler(job):
                 pulid_unpatch = None
 
         # ── Pass 1: Base Generation ──
-        image = pass1_generate(ref_image, full_prompt, strength, seed, guidance,
-                               ip_adapter_embeds=ip_adapter_embeds)
+        # 10 jul (Fable audit): pass1_generate used to run OUTSIDE a try/finally around the PuLID
+        # unpatch below. If it raised (CUDA OOM, a ControlNet shape error, anything), the top-level
+        # handler exception caught it and returned an error to this request — but the shared
+        # transformer stayed monkey-patched with THIS escort's face identity on the warm worker.
+        # The next job (a different escort, or no face ref at all) would then generate with the
+        # previous escort's face injected via PuLID cross-attention. Worse: if that next job also
+        # uses PuLID, patch_flux() captures the already-patched forward as "original", so unpatching
+        # afterward restores the stale patch permanently until the worker restarts. try/finally
+        # guarantees the unpatch runs even on failure, same as any resource-cleanup pattern.
+        try:
+            image = pass1_generate(ref_image, full_prompt, strength, seed, guidance,
+                                   ip_adapter_embeds=ip_adapter_embeds)
+        finally:
+            if pulid_unpatch is not None:
+                pulid_unpatch()
+                pulid_unpatch = None
         passes_run.append("base")
-
-        # Unpatch PuLID after base generation (must restore original forwards)
-        if pulid_unpatch is not None:
-            pulid_unpatch()
 
         # ── Fix Passes (2, 3, 3e, 3d) ──
         if not skip_fix:
