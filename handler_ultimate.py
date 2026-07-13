@@ -14,7 +14,12 @@ Pipeline (same as generate_ultimate.py v12b):
 
 Input schema:
 {
-    "lookbook_image_url": str,     # Reference photo URL (from lookbook)
+    "lookbook_image_url": str,     # Reference photo URL (from lookbook) — OR text2image=true
+    "text2image": bool,             # 13 jul: reference-free mode. Synthesizes the base/reference
+                                    # image from the prompt itself (bare Flux txt2img, LoRAs
+                                    # DISABLED for that stage), then runs the EXACT same Pass 1
+                                    # (dual ControlNet + LoRAs + PuLID) and all fix passes on it,
+                                    # as if it were a lookbook pick. See synthesize_base_image().
     "prompt": str,                  # Scene description
     "clothing_prompt": str,         # Clothing prompt snippet
     "clothing_desc": str,           # Clothing detail for fix passes
@@ -754,6 +759,95 @@ def build_full_prompt(body_desc, expression_hint, scene_prompt, clothing_prompt=
         parts.append(scene_prompt)
 
     return ", ".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Pass 0 (text2image mode only): Synthesize the reference image from text
+# ---------------------------------------------------------------------------
+
+txt2img_helper = None  # FluxPipeline sharing all components with img2img_pipe
+
+
+def synthesize_base_image(prompt, seed, width=768, height=1024):
+    """Reference-free mode: synthesize the 'lookbook reference' from text (13 jul).
+
+    Why this exists: Pass 1 architecturally REQUIRES a reference image — the depth map and DWPose
+    skeleton that condition the dual ControlNet are extracted FROM it, and it is the img2img init.
+    With no lookbook pick and no self-upload there is nothing to extract from. Rather than fall
+    back to a bare single-LoRA txt2img (which would skip ControlNet, PuLID and every fix pass —
+    visibly worse than what reference-based shoots deliver), we synthesize a plain base photo from
+    the creator's described scene and then feed it through the UNCHANGED full pipeline exactly as
+    if she had picked it from the lookbook. From Pass 1 onward nothing differs.
+
+    The synthesis stage runs with all LoRAs DISABLED — a lookbook reference is a photo of some
+    other woman with no escort identity and no Zishy style in it, and this stage plays exactly
+    that role. Identity comes from the face LoRA + PuLID in Pass 1, style from the style LoRA in
+    Pass 1. (Also avoids the style LoRA painting a Zishy watermark into the base.) The pipeline
+    wrapper shares transformer/encoders/VAE with img2img_pipe — zero extra VRAM, same pattern as
+    the IP-Adapter helper above.
+    """
+    global txt2img_helper
+
+    if txt2img_helper is None:
+        from diffusers import FluxPipeline
+        txt2img_helper = FluxPipeline(
+            transformer=img2img_pipe.transformer,
+            text_encoder=img2img_pipe.text_encoder,
+            text_encoder_2=img2img_pipe.text_encoder_2,
+            vae=img2img_pipe.vae,
+            scheduler=img2img_pipe.scheduler,
+            tokenizer=img2img_pipe.tokenizer,
+            tokenizer_2=img2img_pipe.tokenizer_2,
+        )
+        log("  [P0] txt2img helper pipeline created (shared components)")
+
+    t0 = time.time()
+    generator = torch.Generator("cuda").manual_seed(seed)
+
+    # LoRAs may be loaded on the shared transformer (they are loaded before this runs, and a warm
+    # worker may carry them from a previous request). Disable for the neutral base, guaranteed
+    # re-enable via finally — the same discipline as the PuLID unpatch in the handler.
+    loras_active = loaded_lora_hash is not None
+    if loras_active:
+        img2img_pipe.disable_lora()
+        log("  [P0] LoRAs temporarily disabled for neutral base synthesis")
+
+    try:
+        result = txt2img_helper(
+            prompt=prompt,
+            width=width,
+            height=height,
+            num_inference_steps=36,
+            guidance_scale=3.5,  # Flux-dev's native sweet spot for txt2img — NOT the img2img 5.0;
+                                 # this stage only establishes pose/composition/framing, Pass 1
+                                 # then redraws it at the golden 0.80/5.0 settings.
+            generator=generator,
+        )
+    finally:
+        if loras_active:
+            img2img_pipe.enable_lora()
+            log("  [P0] LoRAs re-enabled")
+
+    image = result.images[0]
+    log(f"  [P0] Base reference synthesized from text in {time.time()-t0:.1f}s")
+    return image
+
+
+def build_synthesis_prompt(full_prompt, lora_configs):
+    """The synthesis stage sees no LoRAs, so trigger tokens ('agatha_model', 'zishy_style') are
+    meaningless noise to bare Flux — strip them, keep everything else (body build/cup/skin tone
+    words, expression, clothing, scene, the anatomy phrase), and anchor the photographic register
+    the whole platform is built around (casual/candid, never porno-aesthetic)."""
+    prompt = full_prompt
+    for config in lora_configs:
+        trigger = str(config.get("trigger", "")).strip()
+        if trigger:
+            prompt = prompt.replace(trigger + ", ", "").replace(", " + trigger, "").replace(trigger, "")
+    prompt = ", ".join(p.strip() for p in prompt.split(",") if p.strip())
+    return (
+        "candid amateur photograph of a beautiful woman, natural lighting, "
+        "shot on a consumer camera, " + prompt + ", clean image without any text or watermark"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1562,14 +1656,19 @@ def handler(job):
                 "status": "ok",
                 "message": "healthy",
                 "vram_gb": round(torch.cuda.max_memory_allocated() / 1e9, 1),
-                "handler_version": "v4.3-bodycrop",
+                "handler_version": "v4.4-text2image",
                 "pulid_available": pulid_ok,
                 "pulid_error": pulid_error,
             }
 
         lookbook_url = inp.get("lookbook_image_url", "")
-        if not lookbook_url:
-            return {"status": "error", "error": "lookbook_image_url is required"}
+        text2image = bool(inp.get("text2image", False))
+        if not lookbook_url and not text2image:
+            return {"status": "error", "error": "lookbook_image_url is required (or text2image=true)"}
+        if text2image and not str(inp.get("prompt", "")).strip():
+            # In reference-free mode the prompt IS the shoot — the synthesized base has nothing
+            # else to go on. A reference-based request may legitimately have an empty scene prompt.
+            return {"status": "error", "error": "text2image mode requires a non-empty prompt"}
 
         lora_configs = inp.get("loras", [])
         if not lora_configs:
@@ -1626,9 +1725,19 @@ def handler(job):
         total_t0 = time.time()
         passes_run = []
 
-        # Download reference image
-        ref_image = download_image(lookbook_url)
-        ref_image = remove_watermark(ref_image)
+        if text2image:
+            # ── Pass 0: synthesize the reference from text (reference-free mode) ──
+            # Everything after this line treats the synthesized image exactly like a downloaded
+            # lookbook reference. No remove_watermark() crop: that exists for Zishy source photos,
+            # and the synthesis stage runs LoRA-free so there is no watermark to crop.
+            synthesis_prompt = build_synthesis_prompt(full_prompt, lora_configs)
+            log(f"  [P0] Synthesis prompt: {synthesis_prompt[:120]}...")
+            ref_image = synthesize_base_image(synthesis_prompt, seed)
+            passes_run.append("txt2img_base")
+        else:
+            # Download reference image
+            ref_image = download_image(lookbook_url)
+            ref_image = remove_watermark(ref_image)
 
         # Prepare IP-Adapter body conditioning (skip if disabled)
         ip_adapter_embeds = None
@@ -1801,7 +1910,7 @@ def handler(job):
             "inference_time": round(total_elapsed, 2),
             "passes_run": passes_run,
             "watermark_id": watermark_id_hex,
-            "handler_version": "v4.3-bodycrop",
+            "handler_version": "v4.4-text2image",
             "skin_debug": _skin_mask_error,
         }
 
