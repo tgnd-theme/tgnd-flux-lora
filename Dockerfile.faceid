@@ -1,0 +1,21 @@
+# Cabine42 face-identity serverless worker (InsightFace/ArcFace).
+# CPU is plenty for single-image embed/score (~1s); GPU optional via CUDAExecutionProvider.
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+        runpod \
+        insightface==0.7.3 \
+        onnxruntime==1.19.2 \
+        numpy \
+        pillow \
+        opencv-python-headless
+
+# Pre-download the buffalo_l model at build time so cold starts don't fetch it.
+RUN python -c "from insightface.app import FaceAnalysis; a=FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider']); a.prepare(ctx_id=-1, det_size=(640,640))"
+
+COPY face_embed_handler.py /app/face_embed_handler.py
+WORKDIR /app
+CMD ["python", "-u", "face_embed_handler.py"]
